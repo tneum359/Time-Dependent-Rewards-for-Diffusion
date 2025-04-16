@@ -60,73 +60,60 @@ class TimeDependentDataset(Dataset):
         Returns:
             tuple: (final_image, intermediate_image, timestep)
         """
-        # Choose a random timestep between 1 and 49
+        # Choose a random timestep between 1 and 29
         num_inference_steps = 30
         random_step = random.randint(1, num_inference_steps - 1)
         captured_timestep = torch.tensor(random_step)
         
-        # Override the scheduler step method to capture intermediate latents
-        original_step = self.pipeline.scheduler.step
+        # Initialize a variable to store intermediate latents
         intermediate_latents = None
         
-        # Create our own step counter
-        step_counter = 0
-        
-        def wrapped_step_function(*args, **kwargs):
-            nonlocal intermediate_latents, step_counter
-            
-            # Increment our own step counter
-            step_counter += 1
-            
-            # Get the return_dict parameter or default to True
-            return_dict = kwargs.get('return_dict', True)
-            
-            # Call the original step function
-            step_output = original_step(*args, **kwargs)
-            
+        # Define callback function to capture intermediate results
+        def capture_callback(step, timestep, latents):
+            nonlocal intermediate_latents
             # If we're at our target step, save the latents
-            if step_counter == random_step:
-                # Handle both tuple and dict return types
-                if return_dict:
-                    # When return_dict=True, we get an object with prev_sample attribute
-                    intermediate_latents = step_output.prev_sample
-                else:
-                    # When return_dict=False, we get a tuple where the first element is the sample
-                    intermediate_latents = step_output[0]
-                
-            return step_output
+            if step == random_step:
+                intermediate_latents = latents.detach().clone()
+            return {}
         
-        try:
-            # Temporarily override the step function
-            self.pipeline.scheduler.step = wrapped_step_function
-            
-            # Generate image
-            with torch.no_grad():
-                output = self.pipeline(
-                    prompt="",  # Empty prompt for random generation
-                    height=self.image_size,
-                    width=self.image_size,
-                    guidance_scale=3.5,
-                    num_inference_steps=num_inference_steps,
-                    max_sequence_length=512,
-                    output_type="pt"  # Get tensor output directly
-                )
-        finally:
-            # Restore the original step function
-            self.pipeline.scheduler.step = original_step
+        # Generate image with callback
+        with torch.no_grad():
+            output = self.pipeline(
+                prompt="",  # Empty prompt for random generation
+                height=self.image_size,
+                width=self.image_size,
+                guidance_scale=3.5,
+                num_inference_steps=num_inference_steps,
+                max_sequence_length=512,
+                output_type="pt",  # Get tensor output directly
+                callback_on_step_end=capture_callback,
+                callback_on_step_end_tensor_inputs=["latents"]
+            )
         
         # Get the final image from the output
         final_image = output.images[0]
         
         # Convert intermediate latents to image
         if intermediate_latents is not None:
-            # Use the VAE to decode the latents to image
-            intermediate_image = self.pipeline.vae.decode(intermediate_latents / self.pipeline.vae.config.scaling_factor).sample
-            # Convert to proper format (0-1 range)
-            intermediate_image = (intermediate_image / 2 + 0.5).clamp(0, 1)
-            # Adjust dimensions if needed (batch, channels, height, width) -> (channels, height, width)
-            if intermediate_image.dim() == 4:
-                intermediate_image = intermediate_image[0]
+            # We need to make sure it's in the right format and do post-processing as the pipeline would
+            # The Flux pipeline might use a different format than standard diffusion models
+            
+            # Try to decode latents using the pipeline's VAE
+            with torch.no_grad():
+                # Process latents the same way the pipeline does before decoding
+                intermediate_image = self.pipeline.decode_latents(intermediate_latents)
+                
+                # If decode_latents isn't available, try manual decoding
+                if intermediate_image is None:
+                    # Normalize latents if needed
+                    latents_for_decode = intermediate_latents / self.pipeline.vae.config.scaling_factor
+                    # Decode to get image
+                    intermediate_image = self.pipeline.vae.decode(latents_for_decode).sample
+                    # Convert to proper format (0-1 range)
+                    intermediate_image = (intermediate_image / 2 + 0.5).clamp(0, 1)
+                    # Adjust dimensions if needed (batch, channels, height, width) -> (channels, height, width)
+                    if intermediate_image.dim() == 4:
+                        intermediate_image = intermediate_image[0]
         else:
             # Fallback if we couldn't capture intermediate state
             print("Warning: Could not capture intermediate state, using final image instead")
