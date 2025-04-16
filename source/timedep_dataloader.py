@@ -4,195 +4,168 @@ from diffusers import FluxPipeline
 import random
 import os
 from huggingface_hub import login
+import traceback # For detailed error printing
 
 class TimeDependentDataset(Dataset):
-    def __init__(self, model_name="flux1.dev", batch_size=4, image_size=1024, device="cuda" if torch.cuda.is_available() else "cpu", hf_token=None):
+    def __init__(self, 
+                 prompts_file="prompts.txt", # Added prompts file argument
+                 model_name="flux1.dev", 
+                 batch_size=4, # Batch size is handled by DataLoader, not dataset itself usually
+                 image_size=1024, 
+                 device="cuda" if torch.cuda.is_available() else "cpu", 
+                 hf_token=None):
         """
-        Simplified wrapper for Flux1.dev model that returns triplets of 
-        (fully denoised image, intermediate denoised image, timestep).
+        Generates triplets of (final_image, intermediate_image, timestep) based on prompts.
         
         Args:
-            model_name (str): Model identifier, "flux1.dev" uses the default Flux model
-            batch_size (int): Number of samples to generate in each batch
-            image_size (int): Size of generated images
-            device (str): Device to use for computation
-            hf_token (str): Hugging Face token for authentication
+            prompts_file (str): Path to a text file containing prompts (one per line).
+            model_name (str): Model identifier.
+            image_size (int): Size of generated images.
+            device (str): Device for computation.
+            hf_token (str): Hugging Face token.
         """
         super().__init__()
-        self.batch_size = batch_size
+        # self.batch_size = batch_size # Store batch size for DataLoader, not used here
         self.image_size = image_size
-        self.device = device
-        
-        # Check for HF token and authenticate if provided
+        self.device = device # Store device if needed internally, though pipeline handles it
+
+        # --- Read Prompts ---
+        self.prompts = []
+        try:
+            with open(prompts_file, 'r') as f:
+                self.prompts = [line.strip() for line in f if line.strip()]
+            if not self.prompts:
+                 raise ValueError(f"No valid prompts found in {prompts_file}")
+            print(f"Loaded {len(self.prompts)} prompts from {prompts_file}")
+        except FileNotFoundError:
+            print(f"Error: Prompts file not found at {prompts_file}")
+            raise
+        except Exception as e:
+            print(f"Error reading prompts file {prompts_file}: {e}")
+            raise
+        # --- End Read Prompts ---
+
+        # --- Set Total Samples ---
+        self.total_samples = len(self.prompts) # Dataset size is number of prompts
+        # --- End Set Total Samples ---
+
+        # --- HF Login ---
         if hf_token:
             login(token=hf_token)
         elif os.environ.get("HF_TOKEN"):
             login(token=os.environ.get("HF_TOKEN"))
         else:
-            print("Warning: No Hugging Face token provided. You may encounter authentication errors.")
-            print("Set the HF_TOKEN environment variable or pass hf_token to the constructor.")
+            print("Warning: No Hugging Face token provided.")
+        # --- End HF Login ---
         
-        # Load Flux pipeline
+        # --- Load Flux Pipeline ---
         try:
             self.pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev", 
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                token=hf_token
+                # token=hf_token # Use environment or login
             )
-            
-            # Enable CPU offload to save VRAM
-            self.pipeline.enable_model_cpu_offload()
+            self.pipeline.enable_model_cpu_offload() # Still enable offload
+            print("Flux pipeline loaded successfully.")
         except Exception as e:
             print(f"Error loading Flux model: {e}")
-            print("Make sure you have a valid Hugging Face token with access to this model.")
+            print(traceback.format_exc())
             raise
-        
-        # Total samples to generate for the dataset
-        self.total_samples = 1000  # Can be adjusted as needed
+        # --- End Load Flux Pipeline ---
         
     def __len__(self):
-        return self.total_samples
+        # The length of the dataset is the number of prompts
+        return self.total_samples 
     
     def __getitem__(self, idx):
         """
-        Generate a triplet of (fully denoised image, intermediate denoised image, timestep).
-        Replicates Flux pipeline's final decoding steps for intermediate latents.
+        Generate a triplet for a specific prompt index.
+        Uses the two-pass approach for reliable intermediate images.
         """
-        num_inference_steps = 30
+        # Get the prompt for this index
+        prompt = self.prompts[idx % len(self.prompts)] # Use modulo for safety if idx goes out of bounds
+        
+        # Choose a random timestep between 1 and 29
+        num_inference_steps = 30 # Example value, adjust if needed
         random_step = random.randint(1, num_inference_steps - 1)
         captured_timestep = torch.tensor(random_step)
-        intermediate_latents = None
+        
+        # Set a fixed seed based on index for reproducibility of this specific sample
+        # Using idx ensures each prompt gets a consistent generation pair across epochs
+        generator = torch.Generator(device="cpu").manual_seed(idx) 
+        
+        final_image = None
+        intermediate_image = None
 
-        # Define callback to capture raw latents
-        def capture_callback(pipe, step, timestep, callback_kwargs):
-            nonlocal intermediate_latents
-            if step == random_step:
-                latents = callback_kwargs["latents"].detach().clone()
-                print(f"Captured raw intermediate latents at step {step}, shape: {latents.shape}")
-                intermediate_latents = latents
-            return callback_kwargs
-
-        # Generate final image and capture intermediate latent
-        with torch.no_grad():
-            output = self.pipeline(
-                prompt="", height=self.image_size, width=self.image_size,
-                guidance_scale=3.5, num_inference_steps=num_inference_steps,
-                max_sequence_length=512, output_type="pt",
-                callback_on_step_end=capture_callback,
-                callback_on_step_end_tensor_inputs=["latents"]
-            )
-        final_image = output.images[0]
-
-        # Decode intermediate latents using Flux's exact procedure
-        if intermediate_latents is not None:
-            try:
-                print(f"Processing intermediate latents (initial shape: {intermediate_latents.shape})")
-                latents_to_process = intermediate_latents
-
-                # --- Step 1: Unpack Latents ---
-                # Check if the pipeline has the specific _unpack_latents method
-                if hasattr(self.pipeline, "_unpack_latents"):
-                    try:
-                        # Calculate the VAE scale factor based on its architecture (depth)
-                        vae_scale_factor = 2 ** (len(self.pipeline.vae.config.block_out_channels) - 1)
-                        print(f"Attempting to unpack latents using _unpack_latents with calculated vae_scale_factor={vae_scale_factor}...")
-                        latents_to_process = self.pipeline._unpack_latents(
-                            latents_to_process,
-                            self.image_size, # target height
-                            self.image_size, # target width
-                            vae_scale_factor
-                        )
-                        print(f"Unpacked latents shape: {latents_to_process.shape}")
-                    except Exception as unpack_e:
-                        print(f"WARNING: _unpack_latents failed: {unpack_e}. Attempting direct reshape as fallback.")
-                        # Fallback: Try direct reshape if element count matches expected VAE input
-                        latent_channels = self.pipeline.vae.config.latent_channels
-                        latent_height = self.image_size // 8
-                        latent_width = self.image_size // 8
-                        expected_shape = (1, latent_channels, latent_height, latent_width)
-                        if latents_to_process.numel() == (1 * latent_channels * latent_height * latent_width):
-                             print(f"Attempting direct reshape to {expected_shape}")
-                             latents_to_process = latents_to_process.reshape(expected_shape)
-                        else:
-                            raise ValueError(f"Latent shape {latents_to_process.shape} cannot be unpacked or reshaped.") from unpack_e
-                else:
-                    print("Pipeline does not have _unpack_latents. Attempting direct reshape based on element count.")
-                    # If no unpack method, rely solely on reshape if elements match
-                    latent_channels = self.pipeline.vae.config.latent_channels
-                    latent_height = self.image_size // 8
-                    latent_width = self.image_size // 8
-                    expected_shape = (1, latent_channels, latent_height, latent_width)
-                    if latents_to_process.numel() == (1 * latent_channels * latent_height * latent_width):
-                         print(f"Attempting direct reshape to {expected_shape}")
-                         latents_to_process = latents_to_process.reshape(expected_shape)
-                    else:
-                        raise ValueError(f"Latent shape {latents_to_process.shape} cannot be reshaped and _unpack_latents not found.")
-
-                # --- Step 2: Inverse Scale & Shift ---
-                scaling_factor = self.pipeline.vae.config.scaling_factor
-                shift_factor = getattr(self.pipeline.vae.config, "shift_factor", 0.0) # Default to 0 if missing
-                print(f"Applying inverse scale/shift: scaling_factor={scaling_factor}, shift_factor={shift_factor}")
-                
-                # Ensure correct dtype BEFORE scaling/shifting
-                model_dtype = self.pipeline.vae.dtype
-                print(f"Ensuring latents are dtype: {model_dtype}")
-                latents_to_process = latents_to_process.to(dtype=model_dtype)
-
-                # Apply the transformation: z = x / scale + shift
-                latents_for_decode = latents_to_process / scaling_factor + shift_factor
-                print(f"Latents prepared for VAE (shape: {latents_for_decode.shape}, dtype: {latents_for_decode.dtype})")
-
-                # --- Step 3: VAE Decode ---
-                print("Decoding latents using VAE...")
-                with torch.no_grad():
-                    # Decode expects input shape [B, C, H, W]
-                    decoded_output = self.pipeline.vae.decode(latents_for_decode, return_dict=False)
-                    decoded_image_tensor = decoded_output[0] # Extract sample tensor
-                print(f"Decoded VAE sample shape: {decoded_image_tensor.shape}, dtype: {decoded_image_tensor.dtype}")
-
-                # --- Step 4: Post-Processing ---
-                print("Post-processing decoded image using ImageProcessor...")
-                # Use the pipeline's image_processor for correct denormalization etc.
-                intermediate_image = self.pipeline.image_processor.postprocess(
-                    decoded_image_tensor,
-                    output_type="pt" # Keep as tensor [B, C, H, W]
+        try:
+            # First, generate the final image with full steps
+            print(f"Generating final image for prompt idx {idx}...")
+            with torch.no_grad():
+                final_output = self.pipeline(
+                    prompt=prompt, # Use the specific prompt
+                    height=self.image_size,
+                    width=self.image_size,
+                    guidance_scale=3.5,
+                    num_inference_steps=num_inference_steps,
+                    max_sequence_length=512,
+                    output_type="pt",  
+                    generator=generator.manual_seed(idx) # Re-seed generator
                 )
-                # Postprocess returns a list, take the first element
-                if isinstance(intermediate_image, list):
-                    intermediate_image = intermediate_image[0]
+            final_image = final_output.images[0]
+            print(f"  Final image generated.")
 
-                # Remove batch dimension -> [C, H, W]
-                if intermediate_image.dim() == 4 and intermediate_image.shape[0] == 1:
-                     intermediate_image = intermediate_image.squeeze(0)
+            # Then generate the intermediate image by running fewer steps
+            print(f"Generating intermediate image (step {random_step}) for prompt idx {idx}...")
+            with torch.no_grad():
+                intermediate_output = self.pipeline(
+                    prompt=prompt, # Same prompt
+                    height=self.image_size,
+                    width=self.image_size,
+                    guidance_scale=3.5,
+                    num_inference_steps=random_step, # Stop at the target step
+                    max_sequence_length=512,
+                    output_type="pt",
+                    generator=generator.manual_seed(idx) # Re-seed generator again for consistency
+                )
+            intermediate_image = intermediate_output.images[0]
+            print(f"  Intermediate image generated.")
 
-                print(f"Successfully decoded intermediate image (shape: {intermediate_image.shape}, dtype: {intermediate_image.dtype})")
+        except Exception as e:
+             print(f"Error during generation for prompt idx {idx} ('{prompt[:50]}...'): {e}")
+             print(traceback.format_exc())
+             # Return dummy data or re-raise? Returning dummy might hide issues. Re-raising is better.
+             raise RuntimeError(f"Failed generation for idx {idx}") from e
 
-            except Exception as e:
-                import traceback
-                print(f"Error decoding intermediate latents following Flux steps: {e}")
-                print(traceback.format_exc())
-                print("Using final image as fallback")
-                intermediate_image = final_image.clone()
-        else:
-            print("Warning: Could not capture intermediate state, using final image as fallback")
-            intermediate_image = final_image.clone()
+
+        # Ensure tensors are returned
+        if final_image is None or intermediate_image is None:
+             # This should ideally not happen if exceptions are raised properly
+             raise RuntimeError(f"Generation failed to produce images for idx {idx}")
 
         return final_image, intermediate_image, captured_timestep
     
-    def get_dataloader(self, shuffle=True, num_workers=0):
-        """Return a DataLoader using this dataset"""
-        return DataLoader(
-            self,
-            batch_size=self.batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers
-        )
+    # get_dataloader method is removed from Dataset, it belongs outside
 
-def load_diffusion_dataloader(batch_size=4, image_size=1024, shuffle=True, num_workers=0, hf_token=None):
-    """Helper function to create and return a dataloader for Flux model"""
+def load_diffusion_dataloader(
+    prompts_file="prompts.txt", # Pass prompts file path
+    batch_size=4, 
+    image_size=1024, 
+    shuffle=True, # Usually True for training
+    num_workers=0, # Keep 0 for Flux pipeline compatibility
+    hf_token=None):
+    """Helper function to create dataset and dataloader."""
+    print(f"Creating dataset with prompts from: {prompts_file}")
     dataset = TimeDependentDataset(
-        batch_size=batch_size, 
+        prompts_file=prompts_file, # Pass to dataset
         image_size=image_size, 
         hf_token=hf_token
+        # batch_size is not needed for Dataset init
     )
-    return dataset.get_dataloader(shuffle=shuffle, num_workers=num_workers)
+    
+    print(f"Creating DataLoader with batch_size={batch_size}, shuffle={shuffle}, num_workers={num_workers}")
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers # Must be 0 if pipeline is not pickleable
+    )
