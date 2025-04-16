@@ -69,12 +69,19 @@ class TimeDependentDataset(Dataset):
         intermediate_latents = None
         
         # Define callback function to capture intermediate results
-        # The callback format for Flux is (pipe, step, timestep, kwargs)
         def capture_callback(pipe, step, timestep, callback_kwargs):
             nonlocal intermediate_latents
             # If we're at our target step, save the latents
             if step == random_step:
-                intermediate_latents = callback_kwargs["latents"].detach().clone()
+                # Get the latents at this step
+                latents = callback_kwargs["latents"].detach().clone()
+                
+                # Debug output to understand the shape
+                print(f"Raw latent shape: {latents.shape}")
+                
+                # Store the latents for later processing
+                intermediate_latents = latents
+            
             return callback_kwargs
         
         # Generate image with callback
@@ -97,22 +104,42 @@ class TimeDependentDataset(Dataset):
         # Convert intermediate latents to image
         if intermediate_latents is not None:
             try:
-                # Process latents using the pipeline's methods if available
-                if hasattr(self.pipeline, "decode_latents"):
-                    with torch.no_grad():
-                        intermediate_image = self.pipeline.decode_latents(intermediate_latents)
-                # Manual decoding fallback
-                else:
-                    with torch.no_grad():
-                        # Normalize latents if needed
-                        latents_for_decode = intermediate_latents / self.pipeline.vae.config.scaling_factor
-                        # Decode to get image
-                        intermediate_image = self.pipeline.vae.decode(latents_for_decode).sample
-                        # Convert to proper format (0-1 range)
-                        intermediate_image = (intermediate_image / 2 + 0.5).clamp(0, 1)
-                        # Adjust dimensions if needed
-                        if intermediate_image.dim() == 4:
-                            intermediate_image = intermediate_image[0]
+                print("Attempting to decode intermediate latents...")
+                with torch.no_grad():
+                    # Check if latents need reshaping - try to match expected input format
+                    # Flux may be using a different latent dimension format
+                    if intermediate_latents.ndim == 4:
+                        # Get expected dimensions by inspecting the VAE input layer
+                        expected_channels = self.pipeline.vae.config.latent_channels
+                        if intermediate_latents.shape[1] != expected_channels:
+                            print(f"Reshaping latents from {intermediate_latents.shape} to match expected channels {expected_channels}")
+                            
+                            # Handle different channel dimensions - this is a common issue
+                            if intermediate_latents.shape[1] == 1 and expected_channels > 1:
+                                # Repeat the single channel to match expected channels
+                                intermediate_latents = intermediate_latents.repeat(1, expected_channels, 1, 1)
+                                print(f"Expanded channels: {intermediate_latents.shape}")
+                    
+                    # Normalize latents with scaling factor
+                    latents_for_decode = intermediate_latents / self.pipeline.vae.config.scaling_factor
+                    print(f"Latents shape after normalization: {latents_for_decode.shape}")
+                    
+                    # Scale latents if needed (this is sometimes required)
+                    # Attempt VAE decoding
+                    decoded = self.pipeline.vae.decode(latents_for_decode)
+                    print(f"Decoded type: {type(decoded)}, has sample: {hasattr(decoded, 'sample')}")
+                    
+                    # Get the sample from the decoded output
+                    intermediate_image = decoded.sample
+                    
+                    # Convert to proper format (0-1 range)
+                    intermediate_image = (intermediate_image / 2 + 0.5).clamp(0, 1)
+                    
+                    # Adjust dimensions if needed
+                    if intermediate_image.dim() == 4:
+                        intermediate_image = intermediate_image[0]
+                    
+                    print(f"Final intermediate image shape: {intermediate_image.shape}")
             except Exception as e:
                 print(f"Error decoding intermediate latents: {e}")
                 print("Using final image as fallback")
