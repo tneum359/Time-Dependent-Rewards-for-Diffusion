@@ -20,46 +20,48 @@ class PEFTImageReward(nn.Module):
     def __init__(self, base_model_path="ImageReward-v1.0", timestep_dim=320):
         super().__init__()
         print(f"Initializing PEFTImageReward model - loading base: {base_model_path} via ImageReward library")
-        # Load the base reward model instance
         self.base_reward_model = reward.load(base_model_path)
-        # Load a separate instance for getting target scores (frozen)
         self.original_reward_model = reward.load(base_model_path)
         self.original_reward_model.eval()
 
-        # --- Corrected Access to vision_model ---
-        # Access vision_model directly from the loaded base_reward_model object
-        if not hasattr(self.base_reward_model, 'vision_model'):
-             # If this fails, you might need to inspect the structure of self.base_reward_model
-             # using print(self.base_reward_model) after loading it.
-             raise AttributeError("Loaded ImageReward object does not have 'vision_model' attribute.")
-        # This is the part we will wrap with PEFT
-        self.vision_encoder = self.base_reward_model.vision_model
+        # --- Corrected Access Attempt 2: Try 'visual_encoder' ---
+        # Check if 'visual_encoder' exists directly on the loaded object
+        if hasattr(self.base_reward_model, 'visual_encoder'):
+            self.vision_encoder = self.base_reward_model.visual_encoder
+            print("Identified vision component as 'visual_encoder'")
+        # --- Fallback/Error ---
+        else:
+             # If this also fails, we absolutely need to inspect the object structure
+             print("\n--- DEBUG: Structure of loaded base_reward_model ---")
+             print(self.base_reward_model) # Print the model structure
+             print("--- END DEBUG ---\n")
+             raise AttributeError("Loaded ImageReward object does not have 'vision_model' or 'visual_encoder'. Please check the printed structure above.")
         # --- End Correction ---
 
         self.timestep_embedding = TimestepEmbedding(timestep_dim)
         
         # Get feature dim from the vision_encoder's config
+        # Ensure the identified encoder has a 'config' attribute
+        if not hasattr(self.vision_encoder, 'config') or not hasattr(self.vision_encoder.config, 'hidden_size'):
+             raise AttributeError("Identified vision encoder does not have '.config.hidden_size'. Check structure.")
         self.vision_feature_dim = self.vision_encoder.config.hidden_size
+        print(f"Vision feature dimension: {self.vision_feature_dim}")
         
-        # Layer to fuse vision features and time embedding
         self.fusion_layer = nn.Linear(self.vision_feature_dim + timestep_dim, self.vision_feature_dim)
         
         # Define PEFT configuration
         peft_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION, # Suitable for modifying intermediate features
+            task_type=TaskType.FEATURE_EXTRACTION,
             r=16, 
             lora_alpha=32, 
             lora_dropout=0.1,
-            target_modules=["query", "key", "value", "projection"] # Common targets in vision transformers
+            target_modules=["query", "key", "value", "projection"] # Adjust if needed based on vision_encoder type
         )
-        # Apply PEFT to the vision_encoder
+        # Apply PEFT to the identified vision_encoder
         self.vision_encoder = get_peft_model(self.vision_encoder, peft_config)
-        print(f"PEFT applied to vision_encoder. Trainable params: {sum(p.numel() for p in self.vision_encoder.parameters() if p.requires_grad)}")
+        print(f"PEFT applied to vision_encoder. Trainable params in vision_encoder: {sum(p.numel() for p in self.vision_encoder.parameters() if p.requires_grad)}")
 
-        # --- Identify the reward head/final layer from the base model ---
-        # We need the layer(s) that come *after* the vision_encoder's pooler_output
-        # This part requires knowing the structure of ImageReward-v1.0
-        # Common names: 'reward_head', 'score_head', 'mlp_head', 'fc'
+        # --- Identify the reward head (logic remains the same, check common names) ---
         if hasattr(self.base_reward_model, 'reward_head'):
              self.reward_head = self.base_reward_model.reward_head
              print("Identified reward head: 'reward_head'")
@@ -73,54 +75,33 @@ class PEFTImageReward(nn.Module):
              self.reward_head = self.base_reward_model.fc
              print("Identified reward head: 'fc'")
         else:
-            # Fallback: Try to find the last linear layer (less robust)
-            try:
+             # Fallback attempt (less robust)
+             try:
                  last_layer = list(self.base_reward_model.children())[-1]
                  while not isinstance(last_layer, nn.Linear) and list(last_layer.children()):
-                      last_layer = list(last_layer.children())[-1] # Recurse into last child
+                      last_layer = list(last_layer.children())[-1] 
                  if isinstance(last_layer, nn.Linear):
                       self.reward_head = last_layer
                       print(f"Identified reward head dynamically as last Linear layer: {self.reward_head}")
-                 else:
-                      raise AttributeError("Could not automatically identify the reward head layer.")
-            except Exception as e:
-                 raise AttributeError(f"Could not automatically identify the reward head layer. Checked common names and last layer. Error: {e}")
+                 else: raise AttributeError("Dynamic search failed.")
+             except Exception as e:
+                 raise AttributeError(f"Could not automatically identify the reward head layer. Error: {e}")
 
-        # --- Freeze the original base model's parameters (except the PEFT part) ---
-        # We already froze original_reward_model, now ensure base_reward_model layers are frozen
-        # *except* for the LoRA layers added by PEFT to self.vision_encoder
+        # --- Freezing Parameters (logic remains the same) ---
         for name, param in self.base_reward_model.named_parameters():
-             param.requires_grad = False # Freeze everything initially
+             param.requires_grad = False 
+        for param in self.timestep_embedding.parameters(): param.requires_grad = True
+        for param in self.fusion_layer.parameters(): param.requires_grad = True
+        # PEFT handles LoRA layers within self.vision_encoder
 
-        # PEFT automatically handles making LoRA layers trainable within self.vision_encoder
-        # We also need to make our custom layers trainable:
-        for param in self.timestep_embedding.parameters():
-            param.requires_grad = True
-        for param in self.fusion_layer.parameters():
-            param.requires_grad = True
-            
         print("PEFTImageReward model configuration complete.")
-
+        
     def forward(self, image, timestep):
-        """
-        Forward pass for the PEFT model predicting reward from intermediate image.
-        """
-        # 1. Get timestep embedding
-        timestep_emb = self.timestep_embedding(timestep) # [B, timestep_dim]
-        
-        # 2. Get image features using the PEFT-wrapped vision_encoder
-        # The vision_encoder is the modified self.base_reward_model.vision_model
+        timestep_emb = self.timestep_embedding(timestep)
         vision_outputs = self.vision_encoder(image) 
-        image_features = vision_outputs.pooler_output # [B, vision_feature_dim]
-        
-        # 3. Concatenate image features and timestep embedding
-        combined_features = torch.cat([image_features, timestep_emb], dim=1) # [B, vision_feature_dim + timestep_dim]
-        
-        # 4. Fuse features using our trainable fusion layer
-        fused_features = self.fusion_layer(combined_features) # [B, vision_feature_dim]
-        
-        # 5. Pass the fused features through the original model's reward head
-        # We use the self.reward_head identified during __init__
+        image_features = vision_outputs.pooler_output 
+        combined_features = torch.cat([image_features, timestep_emb], dim=1)
+        fused_features = self.fusion_layer(combined_features) 
         try:
             reward_score = self.reward_head(fused_features)
         except Exception as e:
@@ -128,8 +109,7 @@ class PEFTImageReward(nn.Module):
              print(f"Fused features shape: {fused_features.shape}")
              print(f"Reward head: {self.reward_head}")
              raise
-
-        return reward_score # Should output shape [B, 1] or similar scalar score per item
+        return reward_score
 
 class TimestepEmbedding(nn.Module):
     def __init__(self, dim):
