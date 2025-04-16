@@ -69,16 +69,20 @@ class TimeDependentDataset(Dataset):
         original_step = self.pipeline.scheduler.step
         intermediate_latents = None
         
+        # Create our own step counter
+        step_counter = 0
+        
         def wrapped_step_function(*args, **kwargs):
-            nonlocal intermediate_latents
-            # Get the step count by checking model_output shape or other means
-            current_step = self.pipeline.scheduler._step_count
+            nonlocal intermediate_latents, step_counter
+            
+            # Increment our own step counter
+            step_counter += 1
             
             # Call the original step function
             step_output = original_step(*args, **kwargs)
             
             # If we're at our target step, save the latents
-            if current_step == random_step:
+            if step_counter == random_step:
                 # The prev_sample contains the denoised latents at this step
                 intermediate_latents = step_output.prev_sample
                 
@@ -131,7 +135,7 @@ class TimeDependentDataset(Dataset):
             num_workers=num_workers
         )
 
-def load_diffusion_dataloader(batch_size=4, image_size=1024, shuffle=True, num_workers=2, hf_token=None):
+def load_diffusion_dataloader(batch_size=4, image_size=1024, shuffle=True, num_workers=0, hf_token=None):
     """Helper function to create and return a dataloader for Flux model"""
     dataset = TimeDependentDataset(
         batch_size=batch_size, 
