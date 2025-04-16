@@ -13,7 +13,7 @@ import glob
 
 # Add parent directory to path to import dataloader
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from dataloader import load_diffusion_dataloader
+from source.timedep_dataloader import load_diffusion_dataloader
 
 # Import model from train.py
 from train import PEFTImageReward, TimestepEmbedding

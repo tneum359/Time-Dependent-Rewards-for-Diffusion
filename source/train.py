@@ -10,7 +10,7 @@ from evaluate import eval_callback
 
 # Add parent directory to path to import dataloader
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from dataloader import load_diffusion_dataloader
+from source.timedep_dataloader import load_diffusion_dataloader
 
 class PEFTImageReward(nn.Module):
     def __init__(self, base_model_path="ImageReward/ImageReward", timestep_dim=320):

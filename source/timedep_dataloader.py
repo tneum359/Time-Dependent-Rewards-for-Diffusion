@@ -122,7 +122,7 @@ class TimeDependentDataset(Dataset):
         
         return final_image, intermediate_image, captured_timestep
     
-    def get_dataloader(self, shuffle=True, num_workers=2):
+    def get_dataloader(self, shuffle=True, num_workers=0):
         """Return a DataLoader using this dataset"""
         return DataLoader(
             self,
