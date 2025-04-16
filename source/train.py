@@ -20,101 +20,116 @@ class PEFTImageReward(nn.Module):
     def __init__(self, base_model_path="ImageReward-v1.0", timestep_dim=320):
         super().__init__()
         print(f"Initializing PEFTImageReward model - loading base: {base_model_path} via ImageReward library")
+        # Load the base reward model instance
         self.base_reward_model = reward.load(base_model_path)
+        # Load a separate instance for getting target scores (frozen)
         self.original_reward_model = reward.load(base_model_path)
         self.original_reward_model.eval()
 
-        # Check if vision_model exists directly on the loaded object
+        # --- Corrected Access to vision_model ---
+        # Access vision_model directly from the loaded base_reward_model object
         if not hasattr(self.base_reward_model, 'vision_model'):
-             # If not, maybe it's under 'blip.vision_model' or similar - needs inspection if this fails
-             # For now, assume it's direct based on common patterns & prior errors
-             raise AttributeError("Loaded ImageReward object does not have 'vision_model' attribute as expected.")
-             
+             # If this fails, you might need to inspect the structure of self.base_reward_model
+             # using print(self.base_reward_model) after loading it.
+             raise AttributeError("Loaded ImageReward object does not have 'vision_model' attribute.")
+        # This is the part we will wrap with PEFT
         self.vision_encoder = self.base_reward_model.vision_model
+        # --- End Correction ---
+
         self.timestep_embedding = TimestepEmbedding(timestep_dim)
         
-        # Get feature dim from the vision_encoder we just assigned
+        # Get feature dim from the vision_encoder's config
         self.vision_feature_dim = self.vision_encoder.config.hidden_size
         
+        # Layer to fuse vision features and time embedding
         self.fusion_layer = nn.Linear(self.vision_feature_dim + timestep_dim, self.vision_feature_dim)
+        
+        # Define PEFT configuration
         peft_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION, r=16, lora_alpha=32, lora_dropout=0.1,
-            target_modules=["query", "key", "value", "projection"]
+            task_type=TaskType.FEATURE_EXTRACTION, # Suitable for modifying intermediate features
+            r=16, 
+            lora_alpha=32, 
+            lora_dropout=0.1,
+            target_modules=["query", "key", "value", "projection"] # Common targets in vision transformers
         )
+        # Apply PEFT to the vision_encoder
         self.vision_encoder = get_peft_model(self.vision_encoder, peft_config)
-        print("PEFTImageReward model initialized.")
+        print(f"PEFT applied to vision_encoder. Trainable params: {sum(p.numel() for p in self.vision_encoder.parameters() if p.requires_grad)}")
+
+        # --- Identify the reward head/final layer from the base model ---
+        # We need the layer(s) that come *after* the vision_encoder's pooler_output
+        # This part requires knowing the structure of ImageReward-v1.0
+        # Common names: 'reward_head', 'score_head', 'mlp_head', 'fc'
+        if hasattr(self.base_reward_model, 'reward_head'):
+             self.reward_head = self.base_reward_model.reward_head
+             print("Identified reward head: 'reward_head'")
+        elif hasattr(self.base_reward_model, 'score_head'):
+             self.reward_head = self.base_reward_model.score_head
+             print("Identified reward head: 'score_head'")
+        elif hasattr(self.base_reward_model, 'mlp_head'):
+             self.reward_head = self.base_reward_model.mlp_head
+             print("Identified reward head: 'mlp_head'")
+        elif hasattr(self.base_reward_model, 'fc') and isinstance(self.base_reward_model.fc, nn.Linear):
+             self.reward_head = self.base_reward_model.fc
+             print("Identified reward head: 'fc'")
+        else:
+            # Fallback: Try to find the last linear layer (less robust)
+            try:
+                 last_layer = list(self.base_reward_model.children())[-1]
+                 while not isinstance(last_layer, nn.Linear) and list(last_layer.children()):
+                      last_layer = list(last_layer.children())[-1] # Recurse into last child
+                 if isinstance(last_layer, nn.Linear):
+                      self.reward_head = last_layer
+                      print(f"Identified reward head dynamically as last Linear layer: {self.reward_head}")
+                 else:
+                      raise AttributeError("Could not automatically identify the reward head layer.")
+            except Exception as e:
+                 raise AttributeError(f"Could not automatically identify the reward head layer. Checked common names and last layer. Error: {e}")
+
+        # --- Freeze the original base model's parameters (except the PEFT part) ---
+        # We already froze original_reward_model, now ensure base_reward_model layers are frozen
+        # *except* for the LoRA layers added by PEFT to self.vision_encoder
+        for name, param in self.base_reward_model.named_parameters():
+             param.requires_grad = False # Freeze everything initially
+
+        # PEFT automatically handles making LoRA layers trainable within self.vision_encoder
+        # We also need to make our custom layers trainable:
+        for param in self.timestep_embedding.parameters():
+            param.requires_grad = True
+        for param in self.fusion_layer.parameters():
+            param.requires_grad = True
+            
+        print("PEFTImageReward model configuration complete.")
 
     def forward(self, image, timestep):
         """
-        Forward pass for the PEFT model predicting reward from intermediate image
-        
-        Args:
-            image: Intermediate denoised image
-            timestep: Diffusion timestep when the intermediate image was captured
-            
-        Returns:
-            Predicted reward score
+        Forward pass for the PEFT model predicting reward from intermediate image.
         """
-        timestep_emb = self.timestep_embedding(timestep)
+        # 1. Get timestep embedding
+        timestep_emb = self.timestep_embedding(timestep) # [B, timestep_dim]
         
-        # Get image features using the PEFT-wrapped vision_encoder
-        vision_outputs = self.vision_encoder(image)
-        image_features = vision_outputs.pooler_output
+        # 2. Get image features using the PEFT-wrapped vision_encoder
+        # The vision_encoder is the modified self.base_reward_model.vision_model
+        vision_outputs = self.vision_encoder(image) 
+        image_features = vision_outputs.pooler_output # [B, vision_feature_dim]
         
-        combined_features = torch.cat([image_features, timestep_emb], dim=1)
-        fused_features = self.fusion_layer(combined_features)
+        # 3. Concatenate image features and timestep embedding
+        combined_features = torch.cat([image_features, timestep_emb], dim=1) # [B, vision_feature_dim + timestep_dim]
         
-        # We need to understand how the base_reward_model uses vision outputs.
-        # Option A: Pass modified vision_outputs to the base model's main call (if it accepts it)
+        # 4. Fuse features using our trainable fusion layer
+        fused_features = self.fusion_layer(combined_features) # [B, vision_feature_dim]
+        
+        # 5. Pass the fused features through the original model's reward head
+        # We use the self.reward_head identified during __init__
         try:
-            # Attempt to replace vision_outputs in the base model's call
-            # This assumes the base model's forward can accept precomputed vision_outputs
-             if hasattr(vision_outputs, '_replace'):
-                 modified_vision_outputs = vision_outputs._replace(pooler_output=fused_features)
-             elif hasattr(vision_outputs, 'pooler_output'):
-                  # Clone or copy might be safer if vision_outputs is mutable and reused
-                 modified_vision_outputs = vision_outputs 
-                 modified_vision_outputs.pooler_output = fused_features
-             else:
-                 # Fallback if structure is unknown, might fail later
-                 modified_vision_outputs = vision_outputs 
-
-            # Call the base model's forward method. 
-            # It likely doesn't take `vision_outputs=` as an arg directly.
-            # It might expect pixel_values, OR handle internal logic differently.
-            # Let's try calling the main object directly, assuming it has a forward pass
-            # that uses its internal vision model results. We pass our *modified* features.
-            # This is speculative and might need adjustment based on ImageReward's specific forward pass.
-            
-            # Instead of calling base_reward_model.model, call base_reward_model directly.
-            # We need a way to inject our fused_features. Does it have a reward head?
-            if hasattr(self.base_reward_model, 'reward_head'):
-                 # If there's a separate reward head, pass fused features to it
-                 reward_score = self.base_reward_model.reward_head(fused_features)
-            elif hasattr(self.base_reward_model, 'fc'): # common name for final layer
-                 reward_score = self.base_reward_model.fc(fused_features)
-            else:
-                 # Last resort: try calling the main object, hoping it somehow uses
-                 # the modified vision_outputs implicitly (less likely) or has a path for features.
-                 # This might fail or produce incorrect results.
-                 # result = self.base_reward_model(vision_outputs=modified_vision_outputs, pixel_values=None, return_dict=True)
-                 # reward_score = result.logits 
-                 print("WARNING: Could not find standard reward head ('reward_head' or 'fc'). Final layer logic might be incorrect.")
-                 # Placeholder - Needs specific ImageReward structure knowledge
-                 # Assuming the last layer of the base_reward_model takes the features
-                 # Find the last layer dynamically (fragile)
-                 last_layer = list(self.base_reward_model.children())[-1] 
-                 if isinstance(last_layer, nn.Linear):
-                      reward_score = last_layer(fused_features)
-                 else:
-                      # Cannot determine how to get final score from fused_features.
-                      raise NotImplementedError("Cannot determine how to pass fused features to the final reward calculation layer in ImageReward model.")
-
+            reward_score = self.reward_head(fused_features)
         except Exception as e:
-             print(f"Error during forward pass trying to get reward score: {e}")
+             print(f"Error passing fused features to identified reward head: {e}")
+             print(f"Fused features shape: {fused_features.shape}")
+             print(f"Reward head: {self.reward_head}")
              raise
 
-        return reward_score
+        return reward_score # Should output shape [B, 1] or similar scalar score per item
 
 class TimestepEmbedding(nn.Module):
     def __init__(self, dim):
@@ -206,37 +221,40 @@ def train(
     print(f"Checkpoints will be saved in: {checkpoint_dir}")
 
     # Create model
-    model = PEFTImageReward().to(device)
-    print(f"Model loaded on device: {device}")
-
-    # Freeze original reward model
-    for param in model.original_reward_model.parameters():
-        param.requires_grad = False
-    
-    # Create dataloader using prompts
-    print(f"Loading data using prompts from: {prompts_file}")
     try:
-        dataloader = load_diffusion_dataloader(
-            prompts_file=prompts_file,
-            batch_size=batch_size,
-            image_size=image_size,
-            shuffle=True
-        )
-        dataset_size = len(dataloader.dataset)
-        print(f"Data loaded. Dataset size: {dataset_size} prompts.")
-        if dataset_size == 0:
-            print("ERROR: Dataloader loaded an empty dataset. Check prompts file and dataloader logic.")
-            return None
-    except Exception as e:
-        print(f"ERROR: Failed to load dataloader: {e}")
+        model = PEFTImageReward().to(device)
+        print(f"Model loaded on device: {device}")
+    except Exception as model_init_e:
+        print(f"ERROR: Failed to initialize PEFTImageReward model: {model_init_e}")
         print(traceback.format_exc())
         return None
 
+    # Freeze original_reward_model (already done in PEFTImageReward __init__)
+    # Note: Freezing base_reward_model happens *within* PEFTImageReward __init__ now too
+
+    # Create dataloader
+    print(f"Loading data using prompts from: {prompts_file}")
+    try:
+        dataloader = load_diffusion_dataloader(
+            prompts_file=prompts_file, batch_size=batch_size, image_size=image_size, shuffle=True
+        )
+        dataset_size = len(dataloader.dataset)
+        print(f"Data loaded. Dataset size: {dataset_size} prompts.")
+        if dataset_size == 0: raise ValueError("Dataloader loaded an empty dataset.")
+    except Exception as e:
+        print(f"ERROR: Failed to load dataloader: {e}\n{traceback.format_exc()}")
+        return None
+
+    # Identify trainable parameters (PEFT layers, timestep_embedding, fusion_layer, potentially reward_head if not frozen)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
-         print("ERROR: No trainable parameters found in the model. Check PEFT setup.")
+         print("ERROR: No trainable parameters found in the model. Check PEFT setup and freezing logic in PEFTImageReward __init__.")
+         # Print parameter names and requires_grad status for debugging
+         for name, param in model.named_parameters():
+              print(f"  Param: {name}, Requires Grad: {param.requires_grad}")
          return None
-    print(f"Optimizing {len(trainable_params)} trainable parameters.")
+    print(f"Optimizing {len(trainable_params)} trainable parameters ({sum(p.numel() for p in trainable_params):,} total).")
+
     optimizer = optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.01)
     loss_fn = nn.MSELoss()
     
@@ -256,73 +274,55 @@ def train(
         for i, batch_data in enumerate(dataloader):
             try:
                 final_images, intermediate_images, timesteps = batch_data
+                final_images, intermediate_images, timesteps = final_images.to(device), intermediate_images.to(device), timesteps.to(device)
 
-                final_images = final_images.to(device)
-                intermediate_images = intermediate_images.to(device)
-                timesteps = timesteps.to(device)
-
+                # Target rewards using the frozen original model
                 with torch.no_grad():
                     model.original_reward_model.to(device).eval()
                     target_rewards = model.original_reward_model.score(final_images)
-                    if target_rewards is None:
-                        print(f"Warning: Got None for target_rewards at batch {i}. Skipping.")
-                        continue
-                    
+                    if target_rewards is None: print(f"Warning: Got None target_rewards batch {i}. Skipping."); continue
+                
+                # Predicted rewards using our PEFT model
                 predicted_rewards = model(intermediate_images, timesteps)
-                if predicted_rewards is None:
-                     print(f"Warning: Got None for predicted_rewards at batch {i}. Skipping.")
-                     continue
-
-                if predicted_rewards.shape != target_rewards.shape:
-                    print(f"Warning: Shape mismatch at batch {i}. Predicted: {predicted_rewards.shape}, Target: {target_rewards.shape}. Skipping.")
-                    continue
+                if predicted_rewards is None: print(f"Warning: Got None predicted_rewards batch {i}. Skipping."); continue
+                if predicted_rewards.shape != target_rewards.shape: print(f"Warning: Shape mismatch batch {i}. Pred: {predicted_rewards.shape}, Targ: {target_rewards.shape}. Skipping."); continue
                 
                 loss = loss_fn(predicted_rewards, target_rewards)
                 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
                 
-                epoch_total_loss += loss.item()
-                num_batches += 1
-
-                if (i + 1) % 50 == 0:
-                     current_avg_loss = epoch_total_loss / num_batches
-                     print(f"  Epoch {epoch+1}, Batch {i+1}/{len(dataloader)}, Current Batch Loss: {loss.item():.6f}, Epoch Avg Loss: {current_avg_loss:.6f}")
+                epoch_total_loss += loss.item(); num_batches += 1
+                if (i + 1) % 50 == 0: print(f"  E{epoch+1} B{i+1}/{len(dataloader)}, BatchLoss: {loss.item():.6f}, EpochAvg: {epoch_total_loss/num_batches:.6f}")
 
             except Exception as batch_e:
-                print(f"\nERROR during Epoch {epoch+1}, Batch {i+1}: {batch_e}")
-                print(traceback.format_exc())
-                print("Skipping this batch and continuing training...")
-                continue
+                print(f"\nERROR E{epoch+1} B{i+1}: {batch_e}\n{traceback.format_exc()}\nSkipping batch...")
+                continue # Continue to next batch
 
-        avg_loss = epoch_total_loss / num_batches if num_batches > 0 else 0
+        avg_loss = epoch_total_loss / num_batches if num_batches > 0 else float('nan')
         print(f"--- Epoch {epoch+1}/{num_epochs} finished. Average Training Loss: {avg_loss:.6f} ---")
         
-        epochs_completed.append(epoch + 1)
-        epoch_losses.append(avg_loss)
+        epochs_completed.append(epoch + 1); epoch_losses.append(avg_loss)
 
+        # --- Checkpoint Saving (remains the same) ---
         checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")
         try:
             checkpoint_data = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': avg_loss,
+                'epoch': epoch + 1, 'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(), 'train_loss': avg_loss,
             }
             torch.save(checkpoint_data, checkpoint_path)
             print(f"Checkpoint saved to {checkpoint_path}")
-        except Exception as save_e:
-             print(f"ERROR: Failed to save checkpoint for epoch {epoch+1}: {save_e}")
+        except Exception as save_e: print(f"ERROR saving checkpoint E{epoch+1}: {save_e}")
 
+        # --- Plotting (remains the same) ---
         plot_loss_to_terminal(epochs_completed, epoch_losses)
         
+    # --- Final Save (remains the same) ---
     final_model_path = os.path.join(os.path.dirname(checkpoint_dir), "final_model_state_dict.pt")
     try:
         torch.save(model.state_dict(), final_model_path)
         print(f"Final model state dictionary saved to {final_model_path}")
-    except Exception as final_save_e:
-        print(f"ERROR: Failed to save final model state dictionary: {final_save_e}")
+    except Exception as final_save_e: print(f"ERROR saving final model state: {final_save_e}")
 
     print("\nTraining finished.")
     total_examples_seen = dataset_size * num_epochs
