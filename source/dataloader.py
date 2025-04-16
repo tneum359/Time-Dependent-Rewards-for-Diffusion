@@ -60,43 +60,65 @@ class TimeDependentDataset(Dataset):
         Returns:
             tuple: (final_image, intermediate_image, timestep)
         """
-        # Store intermediate results
-        intermediate_image = None
-        captured_timestep = None
+        # Choose a random timestep between 1 and 49
+        num_inference_steps = 50
+        random_step = random.randint(1, num_inference_steps - 1)
+        captured_timestep = torch.tensor(random_step)
         
-        # Set up callback to capture intermediate image at random timestep
-        random_step = random.randint(1, 49)  # Random step between 1 and 49 (for 50 steps)
+        # Override the scheduler step method to capture intermediate latents
+        original_step = self.pipeline.scheduler.step
+        intermediate_latents = None
         
-        def callback_fn(step, timestep, latents):
-            nonlocal intermediate_image, captured_timestep
-            if step == random_step:
-                # Store timestep and latents for intermediate image
-                captured_timestep = timestep
-                # Convert latents to image using the same process as the pipeline
-                with torch.no_grad():
-                    intermediate_image = self.pipeline.decode_latents(latents)
+        def wrapped_step_function(*args, **kwargs):
+            nonlocal intermediate_latents
+            # Get the step count by checking model_output shape or other means
+            current_step = self.pipeline.scheduler._step_count
+            
+            # Call the original step function
+            step_output = original_step(*args, **kwargs)
+            
+            # If we're at our target step, save the latents
+            if current_step == random_step:
+                # The prev_sample contains the denoised latents at this step
+                intermediate_latents = step_output.prev_sample
+                
+            return step_output
         
-        # Generate image with empty prompt using the callback
-        with torch.no_grad():
-            output = self.pipeline(
-                prompt="",  # Empty prompt for random generation
-                height=self.image_size,
-                width=self.image_size,
-                guidance_scale=3.5,
-                num_inference_steps=50,
-                max_sequence_length=512,
-                callback=callback_fn,
-                callback_steps=1
-            )
+        try:
+            # Temporarily override the step function
+            self.pipeline.scheduler.step = wrapped_step_function
+            
+            # Generate image
+            with torch.no_grad():
+                output = self.pipeline(
+                    prompt="",  # Empty prompt for random generation
+                    height=self.image_size,
+                    width=self.image_size,
+                    guidance_scale=3.5,
+                    num_inference_steps=num_inference_steps,
+                    max_sequence_length=512,
+                    output_type="pt"  # Get tensor output directly
+                )
+        finally:
+            # Restore the original step function
+            self.pipeline.scheduler.step = original_step
         
         # Get the final image from the output
         final_image = output.images[0]
         
-        # Convert PIL to tensor
-        if not isinstance(final_image, torch.Tensor):
-            final_image = torch.from_numpy(final_image).permute(2, 0, 1) / 255.0
-            if intermediate_image is not None and not isinstance(intermediate_image, torch.Tensor):
-                intermediate_image = torch.from_numpy(intermediate_image).permute(2, 0, 1) / 255.0
+        # Convert intermediate latents to image
+        if intermediate_latents is not None:
+            # Use the VAE to decode the latents to image
+            intermediate_image = self.pipeline.vae.decode(intermediate_latents / self.pipeline.vae.config.scaling_factor).sample
+            # Convert to proper format (0-1 range)
+            intermediate_image = (intermediate_image / 2 + 0.5).clamp(0, 1)
+            # Adjust dimensions if needed (batch, channels, height, width) -> (channels, height, width)
+            if intermediate_image.dim() == 4:
+                intermediate_image = intermediate_image[0]
+        else:
+            # Fallback if we couldn't capture intermediate state
+            print("Warning: Could not capture intermediate state, using final image instead")
+            intermediate_image = final_image.clone()
         
         return final_image, intermediate_image, captured_timestep
     
