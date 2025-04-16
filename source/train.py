@@ -24,89 +24,93 @@ class PEFTImageReward(nn.Module):
         self.original_reward_model = reward.load(base_model_path)
         self.original_reward_model.eval()
 
-        # --- Corrected Access Attempt 2: Try 'visual_encoder' ---
-        # Check if 'visual_encoder' exists directly on the loaded object
-        if hasattr(self.base_reward_model, 'visual_encoder'):
-            self.vision_encoder = self.base_reward_model.visual_encoder
-            print("Identified vision component as 'visual_encoder'")
-        # --- Fallback/Error ---
-        else:
-             # If this also fails, we absolutely need to inspect the object structure
+        # --- Corrected Access to visual_encoder via 'blip' ---
+        if not hasattr(self.base_reward_model, 'blip') or not hasattr(self.base_reward_model.blip, 'visual_encoder'):
              print("\n--- DEBUG: Structure of loaded base_reward_model ---")
-             print(self.base_reward_model) # Print the model structure
+             print(self.base_reward_model)
              print("--- END DEBUG ---\n")
-             raise AttributeError("Loaded ImageReward object does not have 'vision_model' or 'visual_encoder'. Please check the printed structure above.")
+             raise AttributeError("Loaded ImageReward object does not have '.blip.visual_encoder'. Check structure.")
+        self.vision_encoder = self.base_reward_model.blip.visual_encoder
+        print("Identified vision component as '.blip.visual_encoder'")
         # --- End Correction ---
 
         self.timestep_embedding = TimestepEmbedding(timestep_dim)
         
         # Get feature dim from the vision_encoder's config
-        # Ensure the identified encoder has a 'config' attribute
         if not hasattr(self.vision_encoder, 'config') or not hasattr(self.vision_encoder.config, 'hidden_size'):
              raise AttributeError("Identified vision encoder does not have '.config.hidden_size'. Check structure.")
-        self.vision_feature_dim = self.vision_encoder.config.hidden_size
+        self.vision_feature_dim = self.vision_encoder.config.hidden_size # Should be 1024
         print(f"Vision feature dimension: {self.vision_feature_dim}")
         
-        self.fusion_layer = nn.Linear(self.vision_feature_dim + timestep_dim, self.vision_feature_dim)
+        # Layer to fuse vision features (1024) and time embedding (320) -> 1024
+        self.fusion_layer = nn.Linear(self.vision_feature_dim + timestep_dim, self.vision_feature_dim) 
         
-        # Define PEFT configuration
+        # --- Define PEFT configuration ---
         peft_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION,
-            r=16, 
-            lora_alpha=32, 
-            lora_dropout=0.1,
-            target_modules=["query", "key", "value", "projection"] # Adjust if needed based on vision_encoder type
+            task_type=TaskType.FEATURE_EXTRACTION, r=16, lora_alpha=32, lora_dropout=0.1,
+            target_modules=["query", "key", "value", "projection"] # Standard ViT targets
         )
-        # Apply PEFT to the identified vision_encoder
+        # Apply PEFT to the vision_encoder
         self.vision_encoder = get_peft_model(self.vision_encoder, peft_config)
         print(f"PEFT applied to vision_encoder. Trainable params in vision_encoder: {sum(p.numel() for p in self.vision_encoder.parameters() if p.requires_grad)}")
 
-        # --- Identify the reward head (logic remains the same, check common names) ---
-        if hasattr(self.base_reward_model, 'reward_head'):
-             self.reward_head = self.base_reward_model.reward_head
-             print("Identified reward head: 'reward_head'")
-        elif hasattr(self.base_reward_model, 'score_head'):
-             self.reward_head = self.base_reward_model.score_head
-             print("Identified reward head: 'score_head'")
-        elif hasattr(self.base_reward_model, 'mlp_head'):
-             self.reward_head = self.base_reward_model.mlp_head
-             print("Identified reward head: 'mlp_head'")
-        elif hasattr(self.base_reward_model, 'fc') and isinstance(self.base_reward_model.fc, nn.Linear):
-             self.reward_head = self.base_reward_model.fc
-             print("Identified reward head: 'fc'")
-        else:
-             # Fallback attempt (less robust)
+        # --- Identify the reward head MLP ---
+        if hasattr(self.base_reward_model, 'mlp'):
+             self.reward_head = self.base_reward_model.mlp
+             # Get the input dimension expected by the reward head's first layer
              try:
-                 last_layer = list(self.base_reward_model.children())[-1]
-                 while not isinstance(last_layer, nn.Linear) and list(last_layer.children()):
-                      last_layer = list(last_layer.children())[-1] 
-                 if isinstance(last_layer, nn.Linear):
-                      self.reward_head = last_layer
-                      print(f"Identified reward head dynamically as last Linear layer: {self.reward_head}")
-                 else: raise AttributeError("Dynamic search failed.")
-             except Exception as e:
-                 raise AttributeError(f"Could not automatically identify the reward head layer. Error: {e}")
+                 # Access the first layer of the sequential stack within mlp
+                 first_layer_of_mlp = self.reward_head.layers[0] 
+                 self.reward_head_in_dim = first_layer_of_mlp.in_features # Should be 768
+                 print(f"Identified reward head: 'mlp' (expects input dim: {self.reward_head_in_dim})")
+             except (AttributeError, IndexError, TypeError):
+                  raise AttributeError("Could not determine input dimension for 'mlp' reward head.")
+        else:
+             raise AttributeError("Could not find 'mlp' attribute for reward head.")
+             
+        # --- Added: Projection layer to match reward head input dimension ---
+        # Maps fused features (1024) to reward head input (768)
+        self.fusion_to_reward_proj = nn.Linear(self.vision_feature_dim, self.reward_head_in_dim)
+        print(f"Added projection layer: {self.vision_feature_dim} -> {self.reward_head_in_dim}")
+        # --- End Added ---
 
-        # --- Freezing Parameters (logic remains the same) ---
+        # --- Freeze Parameters ---
+        # Freeze all params in the original base model first
         for name, param in self.base_reward_model.named_parameters():
              param.requires_grad = False 
+             
+        # Unfreeze our custom layers and PEFT layers
+        # PEFT handles LoRA layers within self.vision_encoder automatically
         for param in self.timestep_embedding.parameters(): param.requires_grad = True
         for param in self.fusion_layer.parameters(): param.requires_grad = True
-        # PEFT handles LoRA layers within self.vision_encoder
+        for param in self.fusion_to_reward_proj.parameters(): param.requires_grad = True # Make the new proj layer trainable
+            
+        print("PEFTImageReward model configuration complete. Trainable layers: PEFT adapters, TimestepEmbedding, FusionLayer, FusionToRewardProj.")
 
-        print("PEFTImageReward model configuration complete.")
-        
     def forward(self, image, timestep):
+        """ Forward pass for the PEFT model predicting reward from intermediate image. """
+        # 1. Get timestep embedding: [B, timestep_dim]
         timestep_emb = self.timestep_embedding(timestep)
+        
+        # 2. Get image features: [B, vision_feature_dim] (e.g., 1024)
         vision_outputs = self.vision_encoder(image) 
         image_features = vision_outputs.pooler_output 
+        
+        # 3. Concatenate: [B, vision_feature_dim + timestep_dim] (e.g., 1024 + 320 = 1344)
         combined_features = torch.cat([image_features, timestep_emb], dim=1)
+        
+        # 4. Fuse features: [B, vision_feature_dim] (e.g., 1344 -> 1024)
         fused_features = self.fusion_layer(combined_features) 
+        
+        # 5. Project fused features to match reward head input: [B, reward_head_in_dim] (e.g., 1024 -> 768)
+        projected_features = self.fusion_to_reward_proj(fused_features)
+        
+        # 6. Pass projected features through the original model's reward head: [B, 1]
         try:
-            reward_score = self.reward_head(fused_features)
+            reward_score = self.reward_head(projected_features)
         except Exception as e:
-             print(f"Error passing fused features to identified reward head: {e}")
-             print(f"Fused features shape: {fused_features.shape}")
+             print(f"Error passing projected features to reward head: {e}")
+             print(f"Projected features shape: {projected_features.shape}")
              print(f"Reward head: {self.reward_head}")
              raise
         return reward_score
