@@ -74,9 +74,9 @@ class TimeDependentDataset(Dataset):
             
             # Capture at our target intermediate step
             if step == random_step:
-                # Get raw latents
+                # Get raw latents from the scheduler output
                 latents = callback_kwargs["latents"].detach().clone()
-                print(f"Captured latents at step {step}, shape: {latents.shape}")
+                print(f"Captured raw intermediate latents at step {step}, shape: {latents.shape}")
                 intermediate_latents = latents
                 
             return callback_kwargs
@@ -90,7 +90,7 @@ class TimeDependentDataset(Dataset):
                 guidance_scale=3.5,
                 num_inference_steps=num_inference_steps,
                 max_sequence_length=512,
-                output_type="pt",  # Get tensor output directly
+                output_type="pt",  # Get tensor output for final_image
                 callback_on_step_end=capture_callback,
                 callback_on_step_end_tensor_inputs=["latents"]
             )
@@ -98,58 +98,75 @@ class TimeDependentDataset(Dataset):
         # Get the final image from the output
         final_image = output.images[0]
         
-        # Convert intermediate latents to image
+        # Convert intermediate latents to image using the correct Flux procedure
         if intermediate_latents is not None:
             try:
                 print(f"Processing intermediate latents with shape: {intermediate_latents.shape}")
                 
+                # --- Step 1: Unpack Latents (Optional - Check if needed) ---
+                # Based on previous errors, the shape [1, 4096, 64] might need reshaping first
                 # Calculate expected VAE shape
-                latent_channels = self.pipeline.vae.config.latent_channels # Usually 16 for Flux? Check config.
+                latent_channels = self.pipeline.vae.config.latent_channels # Usually 16 for Flux
                 latent_height = self.image_size // 8
                 latent_width = self.image_size // 8
                 expected_shape = (1, latent_channels, latent_height, latent_width)
-                print(f"Expected VAE input shape: {expected_shape}")
-                
-                # Calculate total elements to confirm match
-                numel_captured = intermediate_latents.numel()
                 numel_expected = 1 * latent_channels * latent_height * latent_width
+
+                if intermediate_latents.numel() == numel_expected:
+                     print(f"Reshaping intermediate latents from {intermediate_latents.shape} to {expected_shape}")
+                     intermediate_latents = intermediate_latents.reshape(expected_shape)
+                else:
+                     # If unpacking is needed and available:
+                     # if hasattr(self.pipeline, "_unpack_latents") and hasattr(self.pipeline, "vae_scale_factor"):
+                     #      print("Using _unpack_latents...")
+                     #      intermediate_latents = self.pipeline._unpack_latents(intermediate_latents, self.image_size, self.image_size, self.pipeline.vae_scale_factor)
+                     # else:
+                     raise ValueError(f"Latent shape {intermediate_latents.shape} cannot be reshaped to {expected_shape} and _unpack_latents is not available/suitable.")
+
+                # --- Step 2: Inverse Scale & Shift ---
+                scaling_factor = self.pipeline.vae.config.scaling_factor
+                # Check if shift_factor exists, default to 0 if not (though Flux VAE should have it)
+                shift_factor = getattr(self.pipeline.vae.config, "shift_factor", 0.0)
+                print(f"Using scaling_factor: {scaling_factor}, shift_factor: {shift_factor}")
                 
-                if numel_captured != numel_expected:
-                    raise ValueError(f"Element count mismatch: captured {numel_captured}, expected {numel_expected}")
-                    
-                # Reshape directly
-                print(f"Attempting reshape from {intermediate_latents.shape} to {expected_shape}")
-                reshaped_latents = intermediate_latents.reshape(expected_shape)
-                print(f"Reshaped successfully to: {reshaped_latents.shape}")
-                
-                # Match the dtype to the VAE's parameters
+                # Ensure correct dtype BEFORE scaling/shifting
                 model_dtype = self.pipeline.vae.dtype
                 print(f"Ensuring latents are dtype: {model_dtype}")
-                reshaped_latents = reshaped_latents.to(dtype=model_dtype)
-                
-                # Apply the VAE's scaling factor
-                scaling_factor = getattr(self.pipeline.vae.config, "scaling_factor", 0.18215) # Provide a default just in case
-                print(f"Using scaling factor: {scaling_factor}")
-                latents_for_decode = reshaped_latents / scaling_factor
-                
-                # Decode the latents directly using the VAE
+                intermediate_latents = intermediate_latents.to(dtype=model_dtype)
+
+                # Apply the inverse transformation: z = x / scale + shift
+                latents_for_decode = intermediate_latents / scaling_factor + shift_factor
+                print(f"Latents prepared for VAE shape: {latents_for_decode.shape}, dtype: {latents_for_decode.dtype}")
+
+                # --- Step 3: VAE Decode ---
                 print("Decoding latents using VAE...")
-                decoded = self.pipeline.vae.decode(latents_for_decode).sample
-                print(f"Decoded sample shape: {decoded.shape}")
-                
-                # Post-process to image format
-                intermediate_image = (decoded / 2 + 0.5).clamp(0, 1)
-                
-                # Adjust dimensions if needed (remove batch dim)
-                if intermediate_image.dim() == 4:
+                # The VAE decoder might output a tuple or an object, grab the sample
+                decoded_output = self.pipeline.vae.decode(latents_for_decode, return_dict=False)
+                # Assuming the first element is the sample tensor
+                decoded_image_tensor = decoded_output[0] 
+                print(f"Decoded VAE sample shape: {decoded_image_tensor.shape}, dtype: {decoded_image_tensor.dtype}")
+
+                # --- Step 4: Post-Processing ---
+                print("Post-processing decoded image...")
+                # Use the pipeline's image_processor, outputting tensors ('pt')
+                intermediate_image = self.pipeline.image_processor.postprocess(
+                    decoded_image_tensor, 
+                    output_type="pt" # Keep as tensor
+                ) 
+                # image_processor.postprocess usually returns a list of images, take the first one
+                if isinstance(intermediate_image, list):
                     intermediate_image = intermediate_image[0]
-                    
-                print(f"Final intermediate image shape: {intermediate_image.shape}")
+                
+                # Final check for batch dimension (should be [C, H, W])
+                if intermediate_image.dim() == 4 and intermediate_image.shape[0] == 1:
+                     intermediate_image = intermediate_image.squeeze(0)
+                
+                print(f"Final intermediate image shape: {intermediate_image.shape}, dtype: {intermediate_image.dtype}")
                 
             except Exception as e:
                 import traceback
-                print(f"Error decoding intermediate latents: {e}")
-                print(traceback.format_exc())  # Print the full stack trace
+                print(f"Error decoding intermediate latents with Flux steps: {e}")
+                print(traceback.format_exc())
                 print("Using final image as fallback")
                 intermediate_image = final_image.clone()
         else:
