@@ -61,7 +61,7 @@ class TimeDependentDataset(Dataset):
             tuple: (final_image, intermediate_image, timestep)
         """
         # Choose a random timestep between 1 and 49
-        num_inference_steps = 50
+        num_inference_steps = 30
         random_step = random.randint(1, num_inference_steps - 1)
         captured_timestep = torch.tensor(random_step)
         
@@ -78,13 +78,21 @@ class TimeDependentDataset(Dataset):
             # Increment our own step counter
             step_counter += 1
             
+            # Get the return_dict parameter or default to True
+            return_dict = kwargs.get('return_dict', True)
+            
             # Call the original step function
             step_output = original_step(*args, **kwargs)
             
             # If we're at our target step, save the latents
             if step_counter == random_step:
-                # The prev_sample contains the denoised latents at this step
-                intermediate_latents = step_output.prev_sample
+                # Handle both tuple and dict return types
+                if return_dict:
+                    # When return_dict=True, we get an object with prev_sample attribute
+                    intermediate_latents = step_output.prev_sample
+                else:
+                    # When return_dict=False, we get a tuple where the first element is the sample
+                    intermediate_latents = step_output[0]
                 
             return step_output
         
