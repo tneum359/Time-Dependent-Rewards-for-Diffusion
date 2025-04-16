@@ -36,7 +36,8 @@ class TimeDependentDataset(Dataset):
         try:
             self.pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev", 
-                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
+                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+                token=hf_token
             )
             
             # Enable CPU offload to save VRAM
