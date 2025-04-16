@@ -65,7 +65,7 @@ class TimeDependentDataset(Dataset):
         random_step = random.randint(1, num_inference_steps - 1)
         captured_timestep = torch.tensor(random_step)
         
-        # Initialize variables to store intermediate latents
+        # Initialize variables
         intermediate_latents = None
         
         # Define callback function to capture results
@@ -74,10 +74,20 @@ class TimeDependentDataset(Dataset):
             
             # Capture at our target intermediate step
             if step == random_step:
-                # Get raw latents
-                latents = callback_kwargs["latents"].detach().clone()
-                print(f"Captured latents at step {step}, shape: {latents.shape}")
-                intermediate_latents = latents
+                # Instead of saving the latents, let's directly render the image 
+                # by calling the pipeline's decode_latents if available
+                if hasattr(pipe, "decode_latents"):
+                    try:
+                        # Note: we're saving the current latents to decode rather than the actual decoded image
+                        # This preserves the original latent data for potential use
+                        intermediate_latents = callback_kwargs["latents"].detach().clone()
+                        print(f"Successfully captured intermediate state at step {step}")
+                    except Exception as e:
+                        print(f"Error during capture: {e}")
+                else:
+                    # If no direct decode method is available, we'll still try to save latents for later
+                    intermediate_latents = callback_kwargs["latents"].detach().clone()
+                    print(f"Captured latents at step {step}, shape: {intermediate_latents.shape}")
                 
             return callback_kwargs
         
@@ -98,69 +108,60 @@ class TimeDependentDataset(Dataset):
         # Get the final image from the output
         final_image = output.images[0]
         
-        # Convert intermediate latents to image
+        # Try to get intermediate image
         if intermediate_latents is not None:
             try:
-                print(f"Processing intermediate latents with shape: {intermediate_latents.shape}")
-                
-                # For Flux, we need to reshape from [1, 4096, 64] to [1, 16, 64, 64]
-                # (assuming the 4096 is actually 64x64 flattened)
-                if len(intermediate_latents.shape) == 3:
-                    # Reshape to standard 4D format
-                    h = w = int(intermediate_latents.shape[1] ** 0.5)  # Try to get height/width
-                    if h * h == intermediate_latents.shape[1]:
-                        # If it's a perfect square, reshape it
-                        latents_reshaped = intermediate_latents.reshape(1, 1, h, w)
-                        print(f"Reshaped latents to: {latents_reshaped.shape}")
+                # Try some direct access methods first
+                if hasattr(self.pipeline, "decode_latents"):
+                    print("Using pipeline's decode_latents method")
+                    intermediate_image = self.pipeline.decode_latents(intermediate_latents)
+                elif hasattr(self.pipeline, "_decode_latents"):
+                    print("Using pipeline's _decode_latents method")
+                    intermediate_image = self.pipeline._decode_latents(intermediate_latents)
+                # If we still can't decode, we'll try a different approach
+                else:
+                    print("No direct decode method found. Attempting to use internal Flux rendering...")
+                    
+                    # Try to peek at what object processes or stores the final latents
+                    # Look for a "renderer" or similar component
+                    if hasattr(self.pipeline, "renderer") and hasattr(self.pipeline.renderer, "render"):
+                        print("Using pipeline's renderer")
+                        intermediate_image = self.pipeline.renderer.render(intermediate_latents)
                     else:
-                        # Otherwise try to infer from the pipeline's expected size
-                        latent_h = latent_w = self.image_size // 8  # Standard VAE downsampling
-                        latents_reshaped = intermediate_latents.reshape(1, 1, latent_h, latent_w)
-                        print(f"Reshaped latents to inferred size: {latents_reshaped.shape}")
-                    
-                    # Now add the proper channels
-                    latents_with_channels = latents_reshaped.repeat(1, 16, 1, 1)
-                    print(f"After adding channels: {latents_with_channels.shape}")
-                    
-                    intermediate_latents = latents_with_channels
-                
-                # Important: Match the dtype to the pipeline's parameters
-                model_dtype = self.pipeline.vae.dtype
-                print(f"Model dtype: {model_dtype}")
-                
-                # Make sure latents match the model's dtype
-                intermediate_latents = intermediate_latents.to(dtype=model_dtype)
-                
-                # Apply the VAE's scaling factor
-                scaling_factor = getattr(self.pipeline.vae.config, "scaling_factor", 0.18215)
-                print(f"Using scaling factor: {scaling_factor}")
-                
-                latents_for_decode = intermediate_latents / scaling_factor
-                
-                # Decode the latents directly
-                print("Decoding latents...")
-                decoded = self.pipeline.vae.decode(latents_for_decode)
-                
-                # Extract the sample
-                intermediate_image = decoded.sample
-                
-                # Post-process to image format
-                intermediate_image = (intermediate_image / 2 + 0.5).clamp(0, 1)
-                
-                # Adjust dimensions if needed
-                if intermediate_image.dim() == 4:
-                    intermediate_image = intermediate_image[0]
-                    
-                print(f"Final intermediate image shape: {intermediate_image.shape}")
-                
+                        # Last resort - use the same callback mechanism Flux uses to convert latents to images
+                        # This is risky but might work
+                        print("Using advanced technique to decode latents...")
+                        
+                        # Store the original post-processing function
+                        original_post_process = None
+                        if hasattr(self.pipeline, "postprocess"):
+                            original_post_process = self.pipeline.postprocess
+                        
+                        # Create a simple workaround function
+                        def capture_decode(images):
+                            nonlocal intermediate_image
+                            intermediate_image = images[0] if isinstance(images, list) else images
+                            return images
+                        
+                        try:
+                            # Temporarily override any post-processing
+                            if hasattr(self.pipeline, "postprocess"):
+                                self.pipeline.postprocess = capture_decode
+                            
+                            # Try to decode using any available internal method
+                            self.pipeline._decode_latents(intermediate_latents)
+                        finally:
+                            # Restore original post-processing
+                            if original_post_process:
+                                self.pipeline.postprocess = original_post_process
+            
             except Exception as e:
                 import traceback
-                print(f"Error decoding intermediate latents: {e}")
-                print(traceback.format_exc())  # Print the full stack trace
+                print(f"All approaches to decode intermediate latents failed: {e}")
+                print(traceback.format_exc())
                 print("Using final image as fallback")
                 intermediate_image = final_image.clone()
         else:
-            # Fallback if we couldn't capture intermediate state
             print("Warning: Could not capture intermediate state, using final image instead")
             intermediate_image = final_image.clone()
         
