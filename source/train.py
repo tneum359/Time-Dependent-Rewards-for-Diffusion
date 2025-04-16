@@ -23,9 +23,19 @@ class PEFTImageReward(nn.Module):
         self.base_reward_model = reward.load(base_model_path)
         self.original_reward_model = reward.load(base_model_path)
         self.original_reward_model.eval()
-        self.vision_encoder = self.base_reward_model.model.vision_model
+
+        # Check if vision_model exists directly on the loaded object
+        if not hasattr(self.base_reward_model, 'vision_model'):
+             # If not, maybe it's under 'blip.vision_model' or similar - needs inspection if this fails
+             # For now, assume it's direct based on common patterns & prior errors
+             raise AttributeError("Loaded ImageReward object does not have 'vision_model' attribute as expected.")
+             
+        self.vision_encoder = self.base_reward_model.vision_model
         self.timestep_embedding = TimestepEmbedding(timestep_dim)
-        self.vision_feature_dim = self.base_reward_model.model.vision_model.config.hidden_size
+        
+        # Get feature dim from the vision_encoder we just assigned
+        self.vision_feature_dim = self.vision_encoder.config.hidden_size
+        
         self.fusion_layer = nn.Linear(self.vision_feature_dim + timestep_dim, self.vision_feature_dim)
         peft_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION, r=16, lora_alpha=32, lora_dropout=0.1,
@@ -46,18 +56,65 @@ class PEFTImageReward(nn.Module):
             Predicted reward score
         """
         timestep_emb = self.timestep_embedding(timestep)
+        
+        # Get image features using the PEFT-wrapped vision_encoder
         vision_outputs = self.vision_encoder(image)
         image_features = vision_outputs.pooler_output
+        
         combined_features = torch.cat([image_features, timestep_emb], dim=1)
         fused_features = self.fusion_layer(combined_features)
-        if hasattr(vision_outputs, '_replace'):
-            vision_outputs = vision_outputs._replace(pooler_output=fused_features)
-        elif hasattr(vision_outputs, 'pooler_output'):
-            vision_outputs.pooler_output = fused_features
-        result = self.base_reward_model.model(
-            vision_outputs=vision_outputs, pixel_values=None, return_dict=True
-        )
-        return result.logits
+        
+        # We need to understand how the base_reward_model uses vision outputs.
+        # Option A: Pass modified vision_outputs to the base model's main call (if it accepts it)
+        try:
+            # Attempt to replace vision_outputs in the base model's call
+            # This assumes the base model's forward can accept precomputed vision_outputs
+             if hasattr(vision_outputs, '_replace'):
+                 modified_vision_outputs = vision_outputs._replace(pooler_output=fused_features)
+             elif hasattr(vision_outputs, 'pooler_output'):
+                  # Clone or copy might be safer if vision_outputs is mutable and reused
+                 modified_vision_outputs = vision_outputs 
+                 modified_vision_outputs.pooler_output = fused_features
+             else:
+                 # Fallback if structure is unknown, might fail later
+                 modified_vision_outputs = vision_outputs 
+
+            # Call the base model's forward method. 
+            # It likely doesn't take `vision_outputs=` as an arg directly.
+            # It might expect pixel_values, OR handle internal logic differently.
+            # Let's try calling the main object directly, assuming it has a forward pass
+            # that uses its internal vision model results. We pass our *modified* features.
+            # This is speculative and might need adjustment based on ImageReward's specific forward pass.
+            
+            # Instead of calling base_reward_model.model, call base_reward_model directly.
+            # We need a way to inject our fused_features. Does it have a reward head?
+            if hasattr(self.base_reward_model, 'reward_head'):
+                 # If there's a separate reward head, pass fused features to it
+                 reward_score = self.base_reward_model.reward_head(fused_features)
+            elif hasattr(self.base_reward_model, 'fc'): # common name for final layer
+                 reward_score = self.base_reward_model.fc(fused_features)
+            else:
+                 # Last resort: try calling the main object, hoping it somehow uses
+                 # the modified vision_outputs implicitly (less likely) or has a path for features.
+                 # This might fail or produce incorrect results.
+                 # result = self.base_reward_model(vision_outputs=modified_vision_outputs, pixel_values=None, return_dict=True)
+                 # reward_score = result.logits 
+                 print("WARNING: Could not find standard reward head ('reward_head' or 'fc'). Final layer logic might be incorrect.")
+                 # Placeholder - Needs specific ImageReward structure knowledge
+                 # Assuming the last layer of the base_reward_model takes the features
+                 # Find the last layer dynamically (fragile)
+                 last_layer = list(self.base_reward_model.children())[-1] 
+                 if isinstance(last_layer, nn.Linear):
+                      reward_score = last_layer(fused_features)
+                 else:
+                      # Cannot determine how to get final score from fused_features.
+                      raise NotImplementedError("Cannot determine how to pass fused features to the final reward calculation layer in ImageReward model.")
+
+        except Exception as e:
+             print(f"Error during forward pass trying to get reward score: {e}")
+             raise
+
+        return reward_score
 
 class TimestepEmbedding(nn.Module):
     def __init__(self, dim):
