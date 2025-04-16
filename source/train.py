@@ -24,68 +24,67 @@ class PEFTImageReward(nn.Module):
         self.original_reward_model = reward.load(base_model_path)
         self.original_reward_model.eval()
 
-        # --- Corrected Access to visual_encoder via 'blip' ---
+        # Access visual_encoder via 'blip'
         if not hasattr(self.base_reward_model, 'blip') or not hasattr(self.base_reward_model.blip, 'visual_encoder'):
              print("\n--- DEBUG: Structure of loaded base_reward_model ---")
-             print(self.base_reward_model)
-             print("--- END DEBUG ---\n")
+             print(self.base_reward_model); print("--- END DEBUG ---\n")
              raise AttributeError("Loaded ImageReward object does not have '.blip.visual_encoder'. Check structure.")
         self.vision_encoder = self.base_reward_model.blip.visual_encoder
         print("Identified vision component as '.blip.visual_encoder'")
-        # --- End Correction ---
 
         self.timestep_embedding = TimestepEmbedding(timestep_dim)
         
-        # Get feature dim from the vision_encoder's config
-        if not hasattr(self.vision_encoder, 'config') or not hasattr(self.vision_encoder.config, 'hidden_size'):
-             raise AttributeError("Identified vision encoder does not have '.config.hidden_size'. Check structure.")
-        self.vision_feature_dim = self.vision_encoder.config.hidden_size # Should be 1024
-        print(f"Vision feature dimension: {self.vision_feature_dim}")
-        
-        # Layer to fuse vision features (1024) and time embedding (320) -> 1024
+        # --- Corrected: Get feature dimension ---
+        # Try common attributes for vision transformer embedding dimension
+        if hasattr(self.vision_encoder, 'embed_dim'):
+            self.vision_feature_dim = self.vision_encoder.embed_dim
+            print(f"Vision feature dimension found via 'embed_dim': {self.vision_feature_dim}")
+        elif hasattr(self.vision_encoder, 'config') and hasattr(self.vision_encoder.config, 'hidden_size'):
+             self.vision_feature_dim = self.vision_encoder.config.hidden_size
+             print(f"Vision feature dimension found via 'config.hidden_size': {self.vision_feature_dim}")
+        else:
+            # If neither works, try inspecting the output layer shape if possible (less reliable)
+            # Or provide better debug info
+            print("\n--- DEBUG: Attributes of vision_encoder ---")
+            print(dir(self.vision_encoder)) # Print available attributes
+            print("--- END DEBUG ---\n")
+            raise AttributeError("Could not determine vision feature dimension from '.embed_dim' or '.config.hidden_size'. Check vision_encoder attributes printed above.")
+        # --- End Correction ---
+
+        # Layer to fuse vision features and time embedding
         self.fusion_layer = nn.Linear(self.vision_feature_dim + timestep_dim, self.vision_feature_dim) 
         
-        # --- Define PEFT configuration ---
+        # Define PEFT configuration
         peft_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION, r=16, lora_alpha=32, lora_dropout=0.1,
-            target_modules=["query", "key", "value", "projection"] # Standard ViT targets
+            target_modules=["query", "key", "value", "projection"] 
         )
-        # Apply PEFT to the vision_encoder
         self.vision_encoder = get_peft_model(self.vision_encoder, peft_config)
         print(f"PEFT applied to vision_encoder. Trainable params in vision_encoder: {sum(p.numel() for p in self.vision_encoder.parameters() if p.requires_grad)}")
 
-        # --- Identify the reward head MLP ---
+        # Identify the reward head MLP
         if hasattr(self.base_reward_model, 'mlp'):
              self.reward_head = self.base_reward_model.mlp
-             # Get the input dimension expected by the reward head's first layer
              try:
-                 # Access the first layer of the sequential stack within mlp
                  first_layer_of_mlp = self.reward_head.layers[0] 
-                 self.reward_head_in_dim = first_layer_of_mlp.in_features # Should be 768
+                 self.reward_head_in_dim = first_layer_of_mlp.in_features 
                  print(f"Identified reward head: 'mlp' (expects input dim: {self.reward_head_in_dim})")
              except (AttributeError, IndexError, TypeError):
                   raise AttributeError("Could not determine input dimension for 'mlp' reward head.")
         else:
              raise AttributeError("Could not find 'mlp' attribute for reward head.")
              
-        # --- Added: Projection layer to match reward head input dimension ---
-        # Maps fused features (1024) to reward head input (768)
+        # Projection layer to match reward head input dimension
         self.fusion_to_reward_proj = nn.Linear(self.vision_feature_dim, self.reward_head_in_dim)
         print(f"Added projection layer: {self.vision_feature_dim} -> {self.reward_head_in_dim}")
-        # --- End Added ---
 
-        # --- Freeze Parameters ---
-        # Freeze all params in the original base model first
-        for name, param in self.base_reward_model.named_parameters():
-             param.requires_grad = False 
-             
-        # Unfreeze our custom layers and PEFT layers
-        # PEFT handles LoRA layers within self.vision_encoder automatically
+        # Freeze Parameters
+        for name, param in self.base_reward_model.named_parameters(): param.requires_grad = False 
         for param in self.timestep_embedding.parameters(): param.requires_grad = True
         for param in self.fusion_layer.parameters(): param.requires_grad = True
-        for param in self.fusion_to_reward_proj.parameters(): param.requires_grad = True # Make the new proj layer trainable
+        for param in self.fusion_to_reward_proj.parameters(): param.requires_grad = True 
             
-        print("PEFTImageReward model configuration complete. Trainable layers: PEFT adapters, TimestepEmbedding, FusionLayer, FusionToRewardProj.")
+        print("PEFTImageReward model configuration complete.")
 
     def forward(self, image, timestep):
         """ Forward pass for the PEFT model predicting reward from intermediate image. """
