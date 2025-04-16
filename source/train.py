@@ -17,9 +17,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from source.timedep_dataloader import load_diffusion_dataloader
 
 class PEFTImageReward(nn.Module):
-    def __init__(self, base_model_path="ImageReward/ImageReward", timestep_dim=320):
+    def __init__(self, base_model_path="ImageReward-v1.0", timestep_dim=320):
         super().__init__()
-        print("Initializing PEFTImageReward model...")
+        print(f"Initializing PEFTImageReward model - loading base: {base_model_path} via ImageReward library")
         self.base_reward_model = reward.load(base_model_path)
         self.original_reward_model = reward.load(base_model_path)
         self.original_reward_model.eval()
