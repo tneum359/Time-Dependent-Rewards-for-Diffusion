@@ -65,24 +65,27 @@ class TimeDependentDataset(Dataset):
         random_step = random.randint(1, num_inference_steps - 1)
         captured_timestep = torch.tensor(random_step)
         
-        # Initialize variables to store final latents and output
-        final_latents = None
+        # Initialize variables to store intermediate latents
         intermediate_latents = None
         
-        # Define callback function to capture results at both stages
+        # Define callback function to capture results
         def capture_callback(pipe, step, timestep, callback_kwargs):
-            nonlocal intermediate_latents, final_latents
+            nonlocal intermediate_latents
             
             # Capture at our target intermediate step
             if step == random_step:
-                intermediate_latents = callback_kwargs["latents"].detach().clone()
-                print(f"Captured intermediate latents at step {step}, shape: {intermediate_latents.shape}")
-            
-            # Also capture the final latents to see how they differ
-            if step == num_inference_steps - 1:
-                final_latents = callback_kwargs["latents"].detach().clone()
-                print(f"Captured final latents at step {step}, shape: {final_latents.shape}")
-            
+                # Get raw latents
+                latents = callback_kwargs["latents"].detach().clone()
+                print(f"Captured latents at step {step}, shape: {latents.shape}")
+                
+                # Immediately reshape to have 16 channels instead of 1
+                if latents.shape[1] == 1:
+                    print("Reshaping latents from 1 to 16 channels")
+                    latents = latents.repeat(1, 16, 1, 1)
+                    print(f"Reshaped latents shape: {latents.shape}")
+                
+                intermediate_latents = latents
+                
             return callback_kwargs
         
         # Generate image with callback
@@ -102,71 +105,49 @@ class TimeDependentDataset(Dataset):
         # Get the final image from the output
         final_image = output.images[0]
         
-        # Try to convert intermediate latents using the same method that worked for final latents
-        if intermediate_latents is not None and final_latents is not None:
+        # Convert intermediate latents to image
+        if intermediate_latents is not None:
             try:
-                print(f"Final image shape: {final_image.shape}")
+                print(f"Processing intermediate latents with shape: {intermediate_latents.shape}")
                 
-                # Examine the internal structure of the pipeline to understand the latent transformation
-                print("Checking internal pipeline structure...")
+                # Check again if we need to reshape
+                if intermediate_latents.shape[1] != 16:
+                    print(f"Reshaping latents to 16 channels (current: {intermediate_latents.shape[1]})")
+                    intermediate_latents = intermediate_latents.repeat(1, 16, 1, 1)
+                    
+                # Apply the VAE's scaling factor - get this directly from the config
+                scaling_factor = getattr(self.pipeline.vae.config, "scaling_factor", 0.18215)
+                print(f"Using scaling factor: {scaling_factor}")
                 
-                # Try to transform the latents similar to how the final latents were transformed
-                # First check if we can access and use the internal _decode_latents method
-                if hasattr(self.pipeline, "_decode_latents"):
-                    print("Using pipeline's internal _decode_latents method")
-                    intermediate_image = self.pipeline._decode_latents(intermediate_latents)
-                else:
-                    print("Using custom latent reshaping for Flux model")
+                latents_for_decode = intermediate_latents / scaling_factor
+                print(f"Latents for decode shape: {latents_for_decode.shape}")
+                
+                # Ensure latents are in the right format
+                if latents_for_decode.dtype != torch.float32:
+                    latents_for_decode = latents_for_decode.to(dtype=torch.float32)
                     
-                    # Determine expected dimensions
-                    orig_h, orig_w = self.image_size, self.image_size
-                    latent_h, latent_w = orig_h // 8, orig_w // 8  # Standard VAE downsampling
+                # Decode the latents directly
+                print("Decoding latents...")
+                decoded = self.pipeline.vae.decode(latents_for_decode)
+                print(f"Decoded type: {type(decoded)}")
+                
+                # Extract the sample
+                intermediate_image = decoded.sample
+                print(f"Intermediate image shape before processing: {intermediate_image.shape}")
+                
+                # Post-process to image format
+                intermediate_image = (intermediate_image / 2 + 0.5).clamp(0, 1)
+                
+                # Adjust dimensions if needed
+                if intermediate_image.dim() == 4:
+                    intermediate_image = intermediate_image[0]
                     
-                    # Reshape intermediate latents to match final latents shape
-                    if final_latents.shape[1] == 16:
-                        # Use final latent's structure to inform our reshape
-                        print(f"Using final latent structure ({final_latents.shape}) as a guide")
-                        
-                        # Calculate a scaling factor for the intermediate latents based on final latents
-                        scaling = final_latents.abs().mean() / intermediate_latents.abs().mean()
-                        print(f"Calculated scaling factor: {scaling}")
-                        
-                        # Create properly shaped latents
-                        reshaped_latents = intermediate_latents.repeat(1, 16, 1, 1)
-                        
-                        # Resize to match expected dimensions if needed
-                        if reshaped_latents.shape[2:] != (latent_h, latent_w):
-                            print(f"Resizing from {reshaped_latents.shape[2:]} to ({latent_h}, {latent_w})")
-                            reshaped_latents = torch.nn.functional.interpolate(
-                                reshaped_latents, 
-                                size=(latent_h, latent_w),
-                                mode='bilinear'
-                            )
-                    else:
-                        # Fallback if the final latents don't have the expected 16 channels
-                        print(f"Final latents don't have 16 channels, creating new reshaped tensor")
-                        reshaped_latents = intermediate_latents.repeat(1, 16, 1, 1)
-                        if reshaped_latents.shape[2:] != (latent_h, latent_w):
-                            reshaped_latents = torch.nn.functional.interpolate(
-                                reshaped_latents, 
-                                size=(latent_h, latent_w),
-                                mode='bilinear'
-                            )
-                    
-                    # Apply the VAE's scaling factor
-                    latents_for_decode = reshaped_latents / self.pipeline.vae.config.scaling_factor
-                    
-                    # Decode the latents
-                    decoded = self.pipeline.vae.decode(latents_for_decode).sample
-                    
-                    # Post-process to image format
-                    intermediate_image = (decoded / 2 + 0.5).clamp(0, 1)
-                    
-                    # Adjust dimensions if needed
-                    if intermediate_image.dim() == 4:
-                        intermediate_image = intermediate_image[0]
+                print(f"Final intermediate image shape: {intermediate_image.shape}")
+                
             except Exception as e:
+                import traceback
                 print(f"Error decoding intermediate latents: {e}")
+                print(traceback.format_exc())  # Print the full stack trace
                 print("Using final image as fallback")
                 intermediate_image = final_image.clone()
         else:
