@@ -77,13 +77,6 @@ class TimeDependentDataset(Dataset):
                 # Get raw latents
                 latents = callback_kwargs["latents"].detach().clone()
                 print(f"Captured latents at step {step}, shape: {latents.shape}")
-                
-                # Immediately reshape to have 16 channels instead of 1
-                if latents.shape[1] == 1:
-                    print("Reshaping latents from 1 to 16 channels")
-                    latents = latents.repeat(1, 16, 1, 1)
-                    print(f"Reshaped latents shape: {latents.shape}")
-                
                 intermediate_latents = latents
                 
             return callback_kwargs
@@ -110,30 +103,46 @@ class TimeDependentDataset(Dataset):
             try:
                 print(f"Processing intermediate latents with shape: {intermediate_latents.shape}")
                 
-                # Check again if we need to reshape
-                if intermediate_latents.shape[1] != 16:
-                    print(f"Reshaping latents to 16 channels (current: {intermediate_latents.shape[1]})")
-                    intermediate_latents = intermediate_latents.repeat(1, 16, 1, 1)
+                # For Flux, we need to reshape from [1, 4096, 64] to [1, 16, 64, 64]
+                # (assuming the 4096 is actually 64x64 flattened)
+                if len(intermediate_latents.shape) == 3:
+                    # Reshape to standard 4D format
+                    h = w = int(intermediate_latents.shape[1] ** 0.5)  # Try to get height/width
+                    if h * h == intermediate_latents.shape[1]:
+                        # If it's a perfect square, reshape it
+                        latents_reshaped = intermediate_latents.reshape(1, 1, h, w)
+                        print(f"Reshaped latents to: {latents_reshaped.shape}")
+                    else:
+                        # Otherwise try to infer from the pipeline's expected size
+                        latent_h = latent_w = self.image_size // 8  # Standard VAE downsampling
+                        latents_reshaped = intermediate_latents.reshape(1, 1, latent_h, latent_w)
+                        print(f"Reshaped latents to inferred size: {latents_reshaped.shape}")
                     
-                # Apply the VAE's scaling factor - get this directly from the config
+                    # Now add the proper channels
+                    latents_with_channels = latents_reshaped.repeat(1, 16, 1, 1)
+                    print(f"After adding channels: {latents_with_channels.shape}")
+                    
+                    intermediate_latents = latents_with_channels
+                
+                # Important: Match the dtype to the pipeline's parameters
+                model_dtype = self.pipeline.vae.dtype
+                print(f"Model dtype: {model_dtype}")
+                
+                # Make sure latents match the model's dtype
+                intermediate_latents = intermediate_latents.to(dtype=model_dtype)
+                
+                # Apply the VAE's scaling factor
                 scaling_factor = getattr(self.pipeline.vae.config, "scaling_factor", 0.18215)
                 print(f"Using scaling factor: {scaling_factor}")
                 
                 latents_for_decode = intermediate_latents / scaling_factor
-                print(f"Latents for decode shape: {latents_for_decode.shape}")
                 
-                # Ensure latents are in the right format
-                if latents_for_decode.dtype != torch.float32:
-                    latents_for_decode = latents_for_decode.to(dtype=torch.float32)
-                    
                 # Decode the latents directly
                 print("Decoding latents...")
                 decoded = self.pipeline.vae.decode(latents_for_decode)
-                print(f"Decoded type: {type(decoded)}")
                 
                 # Extract the sample
                 intermediate_image = decoded.sample
-                print(f"Intermediate image shape before processing: {intermediate_image.shape}")
                 
                 # Post-process to image format
                 intermediate_image = (intermediate_image / 2 + 0.5).clamp(0, 1)
