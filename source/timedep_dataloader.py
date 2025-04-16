@@ -69,12 +69,13 @@ class TimeDependentDataset(Dataset):
         intermediate_latents = None
         
         # Define callback function to capture intermediate results
-        def capture_callback(step, timestep, latents):
+        # The callback format for Flux is (pipe, step, timestep, kwargs)
+        def capture_callback(pipe, step, timestep, callback_kwargs):
             nonlocal intermediate_latents
             # If we're at our target step, save the latents
             if step == random_step:
-                intermediate_latents = latents.detach().clone()
-            return {}
+                intermediate_latents = callback_kwargs["latents"].detach().clone()
+            return callback_kwargs
         
         # Generate image with callback
         with torch.no_grad():
@@ -95,25 +96,27 @@ class TimeDependentDataset(Dataset):
         
         # Convert intermediate latents to image
         if intermediate_latents is not None:
-            # We need to make sure it's in the right format and do post-processing as the pipeline would
-            # The Flux pipeline might use a different format than standard diffusion models
-            
-            # Try to decode latents using the pipeline's VAE
-            with torch.no_grad():
-                # Process latents the same way the pipeline does before decoding
-                intermediate_image = self.pipeline.decode_latents(intermediate_latents)
-                
-                # If decode_latents isn't available, try manual decoding
-                if intermediate_image is None:
-                    # Normalize latents if needed
-                    latents_for_decode = intermediate_latents / self.pipeline.vae.config.scaling_factor
-                    # Decode to get image
-                    intermediate_image = self.pipeline.vae.decode(latents_for_decode).sample
-                    # Convert to proper format (0-1 range)
-                    intermediate_image = (intermediate_image / 2 + 0.5).clamp(0, 1)
-                    # Adjust dimensions if needed (batch, channels, height, width) -> (channels, height, width)
-                    if intermediate_image.dim() == 4:
-                        intermediate_image = intermediate_image[0]
+            try:
+                # Process latents using the pipeline's methods if available
+                if hasattr(self.pipeline, "decode_latents"):
+                    with torch.no_grad():
+                        intermediate_image = self.pipeline.decode_latents(intermediate_latents)
+                # Manual decoding fallback
+                else:
+                    with torch.no_grad():
+                        # Normalize latents if needed
+                        latents_for_decode = intermediate_latents / self.pipeline.vae.config.scaling_factor
+                        # Decode to get image
+                        intermediate_image = self.pipeline.vae.decode(latents_for_decode).sample
+                        # Convert to proper format (0-1 range)
+                        intermediate_image = (intermediate_image / 2 + 0.5).clamp(0, 1)
+                        # Adjust dimensions if needed
+                        if intermediate_image.dim() == 4:
+                            intermediate_image = intermediate_image[0]
+            except Exception as e:
+                print(f"Error decoding intermediate latents: {e}")
+                print("Using final image as fallback")
+                intermediate_image = final_image.clone()
         else:
             # Fallback if we couldn't capture intermediate state
             print("Warning: Could not capture intermediate state, using final image instead")
