@@ -156,7 +156,7 @@ def train(
     image_size=512,
     device="cuda" if torch.cuda.is_available() else "cpu",
     checkpoint_dir="checkpoints",
-    plot_every_n_steps=20 # How often to plot the loss
+    plot_every_n_steps=5 # How often to plot the loss
 ):
     """ Train for one pass through the prompts file, plotting loss per step. """
     os.makedirs(checkpoint_dir, exist_ok=True)
