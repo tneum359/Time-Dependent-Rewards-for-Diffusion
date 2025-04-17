@@ -11,6 +11,7 @@ import io
 from PIL import Image
 import numpy as np
 import traceback
+from torchvision.transforms.functional import to_pil_image
 
 # Add parent directory path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__) if __file__ else '.', '..')))
@@ -96,10 +97,10 @@ class PEFTImageReward(nn.Module):
         # Assuming image input here is the raw tensor from dataloader
         # If base_reward_model has a processor attribute (it should)
         if hasattr(self.base_reward_model, 'vis_processor'):
-             processed_image = self.base_reward_model.vis_processor(image).to(next(self.vision_encoder.parameters()).device) # Prepare image and move to model device
+             processed_image = self.base_reward_model.vis_processor(image.to(next(self.vision_encoder.parameters()).device))
         else:
              # Fallback or error if processor isn't found
-             print("Warning: Cannot find base_reward_model.vis_processor. Assuming input image is already processed.")
+             print("Warning: Cannot find base_reward_model.vis_processor. Using raw image tensor.")
              processed_image = image.to(next(self.vision_encoder.parameters()).device)
 
         vision_outputs = self.vision_encoder(processed_image)
@@ -209,19 +210,26 @@ def train(
             # Move tensors needed for training to the device
             intermediate_images = intermediate_images_cpu.to(device)
             timesteps = timesteps_cpu.to(device)
-            final_images = final_images_cpu.to(device) # Target images also needed on device
+            final_images_gpu = final_images_cpu.to(device) # Keep GPU version for potential score method use
+
+            # --- Convert final images to PIL for score method ---
+            final_images_pil = []
+            for img_tensor in final_images_cpu: # Iterate through batch on CPU
+                # Ensure tensor is C, H, W and has values in [0, 1] if needed by to_pil_image
+                # The dataloader returns images in [0,1] float format typically
+                final_images_pil.append(to_pil_image(img_tensor))
+            # --- End Conversion ---
 
             # Target rewards using the *original* model's score method (needs prompt and PIL image/tensor)
             # Note: original_reward_model.score expects PIL images or tensors and prompt text
             # We need to ensure final_images is in the correct format (likely tensor is fine)
             with torch.no_grad():
                 model.original_reward_model.to(device).eval()
-                # Convert final_images tensor to list of PIL if necessary, or pass tensor directly if score handles it
-                # Assuming score handles tensor [B, C, H, W] and list of prompts [str] * len(B)
-                target_rewards = model.original_reward_model.score(prompts_text, final_images)
-                if target_rewards is None: print(f"W: Skip step {global_step_counter}, None target"); continue
+                # Pass the list of PIL images
+                target_rewards_list = model.original_reward_model.score(prompts_text, final_images_pil) # USE PIL LIST
+                if target_rewards_list is None: print(f"W: Skip step {global_step_counter}, None target"); continue
                 # Score returns list, convert to tensor and move to device
-                target_rewards = torch.tensor(target_rewards, device=device, dtype=torch.float32).unsqueeze(1) #[B, 1]
+                target_rewards = torch.tensor(target_rewards_list, device=device, dtype=torch.float32).unsqueeze(1) #[B, 1]
 
             # Predicted rewards using our PEFT model (takes image tensor, timestep tensor)
             predicted_rewards = model(intermediate_images, timesteps) # Output shape [B, 1]
@@ -242,6 +250,7 @@ def train(
             # Store loss for plotting
             step_losses.append(batch_loss)
             global_steps_list.append(global_step_counter)
+            print("STEP: ", global_step_counter)
 
             # Print progress and plot periodically
             if global_step_counter % plot_every_n_steps == 0:
