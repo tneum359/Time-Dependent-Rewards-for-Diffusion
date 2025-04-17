@@ -56,8 +56,12 @@ class PEFTImageReward(nn.Module):
         
         # Define PEFT configuration
         peft_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION, r=16, lora_alpha=32, lora_dropout=0.1,
-            target_modules=["query", "key", "value", "projection"] 
+            task_type=TaskType.FEATURE_EXTRACTION, 
+            r=16, 
+            lora_alpha=32, 
+            lora_dropout=0.1,
+            # Target the combined QKV layer and the attention projection layer by their actual names
+            target_modules=["qkv", "proj"] 
         )
         self.vision_encoder = get_peft_model(self.vision_encoder, peft_config)
         print(f"PEFT applied to vision_encoder. Trainable params in vision_encoder: {sum(p.numel() for p in self.vision_encoder.parameters() if p.requires_grad)}")
