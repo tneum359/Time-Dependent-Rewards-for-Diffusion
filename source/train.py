@@ -85,25 +85,22 @@ class PEFTImageReward(nn.Module):
 
 
     def forward(self, image, timestep):
-        """
-        Forward pass using intermediate image and timestep.
-        Predicts a score analogous to the original model's score, but based on time-augmented image features.
-        """
+        """ Forward pass for the PEFT model predicting reward from intermediate image. """
         # 1. Get timestep embedding: [B, timestep_dim]
         timestep_emb = self.timestep_embedding(timestep)
 
         # 2. Get image features using PEFT-wrapped vision encoder: [B, vision_feature_dim]
-        # We need to use the base model's processor to prepare the image tensor
-        # Assuming image input here is the raw tensor from dataloader
-        # If base_reward_model has a processor attribute (it should)
+        # Prepare image using the base model's processor
         if hasattr(self.base_reward_model, 'vis_processor'):
              processed_image = self.base_reward_model.vis_processor(image.to(next(self.vision_encoder.parameters()).device))
         else:
-             # Fallback or error if processor isn't found
              print("Warning: Cannot find base_reward_model.vis_processor. Using raw image tensor.")
              processed_image = image.to(next(self.vision_encoder.parameters()).device)
 
-        vision_outputs = self.vision_encoder(processed_image)
+        # --- EDIT: Call vision_encoder using 'pixel_values' keyword argument ---
+        vision_outputs = self.vision_encoder(pixel_values=processed_image)
+        # --- End EDIT ---
+
         image_features = vision_outputs.pooler_output
 
         # 3. Concatenate image features and timestep embedding: [B, vision_feature_dim + timestep_dim]
@@ -116,9 +113,10 @@ class PEFTImageReward(nn.Module):
         projected_features = self.fusion_to_reward_proj(fused_features)
 
         # 6. Pass projected features through the original model's reward head: [B, 1]
-        reward_score = self.reward_head(projected_features)
-
-        return reward_score # Return the raw score output [B, 1]
+        try:
+            reward_score = self.reward_head(projected_features)
+        except Exception as e: print(f"Error in reward head: {e}"); raise
+        return reward_score
 
 class TimestepEmbedding(nn.Module):
     def __init__(self, dim):
@@ -157,7 +155,7 @@ def train(
     image_size=512,
     device="cuda" if torch.cuda.is_available() else "cpu",
     checkpoint_dir="checkpoints",
-    plot_every_n_steps=20 # How often to plot the loss
+    plot_every_n_steps=1 # How often to plot the loss
 ):
     """ Train for one pass through the prompts file, plotting loss per step. """
     os.makedirs(checkpoint_dir, exist_ok=True)
