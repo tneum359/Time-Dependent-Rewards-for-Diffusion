@@ -157,7 +157,7 @@ def train(
     image_size=512,
     device="cuda" if torch.cuda.is_available() else "cpu",
     checkpoint_dir="checkpoints",
-    plot_every_n_steps=5 # How often to plot the loss
+    plot_every_n_steps=20 # How often to plot the loss
 ):
     """ Train for one pass through the prompts file, plotting loss per step. """
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -210,14 +210,15 @@ def train(
             # Move tensors needed for training to the device
             intermediate_images = intermediate_images_cpu.to(device)
             timesteps = timesteps_cpu.to(device)
-            final_images_gpu = final_images_cpu.to(device) # Keep GPU version for potential score method use
+            # final_images_gpu = final_images_cpu.to(device) # Only move if score needed tensor
 
             # --- Convert final images to PIL for score method ---
             final_images_pil = []
             for img_tensor in final_images_cpu: # Iterate through batch on CPU
-                # Ensure tensor is C, H, W and has values in [0, 1] if needed by to_pil_image
-                # The dataloader returns images in [0,1] float format typically
-                final_images_pil.append(to_pil_image(img_tensor))
+                # Convert from bfloat16 (or other) to float32
+                img_tensor_float32 = img_tensor.to(torch.float32)
+                # Now convert the float32 tensor to PIL
+                final_images_pil.append(to_pil_image(img_tensor_float32))
             # --- End Conversion ---
 
             # Target rewards using the *original* model's score method (needs prompt and PIL image/tensor)
