@@ -204,9 +204,8 @@ class TimeDependentDataset(Dataset):
         if final_image is None or intermediate_image is None:
              raise RuntimeError(f"Generation failed for idx {idx}")
 
-        # Return tensors (DataLoader will batch them)
-        # The training loop will move the batch to the correct device.
-        return final_image, intermediate_image, captured_timestep.cpu() # Move timestep back to CPU for collation if needed
+        # Return the 4-tuple, including the prompt string
+        return final_image.cpu(), intermediate_image.cpu(), captured_timestep.cpu(), prompt
 
 def load_diffusion_dataloader(
     prompts_file="prompts.txt", batch_size=4, image_size=1024, 
