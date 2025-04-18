@@ -112,20 +112,26 @@ class PEFTImageReward(nn.Module):
         """ Forward pass including image, timestep, and tokenized text. """
         timestep_emb = self.timestep_embedding(timestep)
         
-        # --- EDIT: Correctly locate and use vis_processor ---
+        # --- EDIT: Check for vis_processor OR image_processor under blip ---
+        vis_processor = None
         # Prepare image using the base model's processor first
-        # The processor is likely nested under 'blip' like other components
-        if hasattr(self.base_reward_model, 'blip') and hasattr(self.base_reward_model.blip, 'vis_processor'):
-            vis_processor = self.base_reward_model.blip.vis_processor
+        if hasattr(self.base_reward_model, 'blip'):
+            if hasattr(self.base_reward_model.blip, 'vis_processor'):
+                vis_processor = self.base_reward_model.blip.vis_processor
+                print("Found processor as 'vis_processor' under 'blip'.") # Debug
+            elif hasattr(self.base_reward_model.blip, 'image_processor'): # Check alternative name
+                vis_processor = self.base_reward_model.blip.image_processor
+                print("Found processor as 'image_processor' under 'blip'.") # Debug
+
+        if vis_processor:
             # Move image tensor to the device where vision_encoder expects it
             device = next(self.vision_encoder.parameters()).device
             # Apply the processor
             processed_image = vis_processor(image.to(device))
-            print(f"Applied vis_processor. Processed image shape: {processed_image.shape}") # Debug print
+            print(f"Applied processor. Processed image shape: {processed_image.shape}") # Debug print
         else:
-             # If no processor found, raise an error as processing is crucial
-             raise AttributeError("Cannot find base_reward_model.blip.vis_processor. Image processing is required.")
-             # processed_image = image.to(next(self.vision_encoder.parameters()).device) # Fallback removed - likely causes errors
+             # If no processor found after checking common names/locations, raise an error
+             raise AttributeError("Cannot find base_reward_model's visual processor (checked blip.vis_processor, blip.image_processor). Image processing is required.")
         # --- End EDIT ---
 
         # Pass the processed image tensor directly as the first argument
