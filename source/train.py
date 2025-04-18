@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from peft import get_peft_model, LoraConfig, TaskType
+from peft import get_peft_model, LoraConfig, TaskType, inject_adapter_in_model
 import sys
 import os
 import matplotlib.pyplot as plt
@@ -29,9 +29,10 @@ class PEFTImageReward(nn.Module):
         self.original_reward_model = reward.load(base_model_path)
         self.original_reward_model.eval()
 
-        # Access and wrap vision encoder with PEFT
+        # Access visual_encoder via 'blip'
         if not hasattr(self.base_reward_model, 'blip') or not hasattr(self.base_reward_model.blip, 'visual_encoder'):
             raise AttributeError("Cannot find '.blip.visual_encoder'.")
+        # Keep the reference to the original encoder
         self.vision_encoder = self.base_reward_model.blip.visual_encoder
         print("Identified vision component as '.blip.visual_encoder'")
 
@@ -39,108 +40,92 @@ class PEFTImageReward(nn.Module):
         self.vision_feature_dim = self.vision_encoder.embed_dim if hasattr(self.vision_encoder, 'embed_dim') else self.vision_encoder.config.hidden_size
         print(f"Vision feature dimension: {self.vision_feature_dim}")
 
-        # Apply PEFT to the vision_encoder
-        peft_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION, r=16, lora_alpha=32, lora_dropout=0.1,
-            target_modules=["qkv", "proj"]
-        )
-        self.vision_encoder = get_peft_model(self.vision_encoder, peft_config)
-        print(f"PEFT applied to vision_encoder.")
-
-        # --- Text Encoder & Projection (Keep references, they remain frozen) ---
+        # Text Encoder & Projection (Keep references, remain frozen)
         if not hasattr(self.base_reward_model.blip, 'text_encoder') or not hasattr(self.base_reward_model.blip, 'text_proj'):
              raise AttributeError("Cannot find '.blip.text_encoder' or '.blip.text_proj'.")
         self.text_encoder = self.base_reward_model.blip.text_encoder
         self.text_proj = self.base_reward_model.blip.text_proj
-        self.text_feature_dim = self.text_proj.out_features # Projected text feature dim (e.g., 256)
+        self.text_feature_dim = self.text_proj.out_features
         print(f"Text Encoder & Projection found. Projected Text dim: {self.text_feature_dim}")
 
-        # Trainable timestep embedding
+        # Timestep Embedding
         self.timestep_embedding = TimestepEmbedding(timestep_dim)
         print(f"Timestep Embedding dim: {timestep_dim}")
 
-        # Trainable layer to fuse PEFT-vision features and time embedding
+        # Fusion Layer (Inputs: Vision + Time + Text)
         total_fused_dim = self.vision_feature_dim + timestep_dim + self.text_feature_dim
-        intermediate_fusion_dim = self.vision_feature_dim 
+        intermediate_fusion_dim = self.vision_feature_dim
         self.fusion_layer = nn.Linear(total_fused_dim, intermediate_fusion_dim)
         print(f"Fusion layer input dim: {total_fused_dim}, output dim: {intermediate_fusion_dim}")
 
-        # Identify the original model's reward head (MLP)
+        # --- Define PEFT configuration ---
+        peft_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION, r=16, lora_alpha=32, lora_dropout=0.1,
+            target_modules=["qkv", "proj"]
+        )
+
+        # --- EDIT: Inject Adapters instead of wrapping ---
+        # Apply PEFT by injecting adapters directly into self.vision_encoder
+        self.vision_encoder = inject_adapter_in_model(peft_config, self.vision_encoder)
+        # Mark adapters as trainable after injection (might be needed depending on peft version)
+        for name, param in self.vision_encoder.named_parameters():
+             if 'lora' in name:
+                  param.requires_grad = True
+        print(f"PEFT adapters injected into vision_encoder.")
+        # --- End EDIT ---
+
+        # Identify the reward head MLP
         if hasattr(self.base_reward_model, 'mlp'):
              self.reward_head = self.base_reward_model.mlp
-             try:
-                 first_layer_of_mlp = self.reward_head.layers[0]
-                 self.reward_head_in_dim = first_layer_of_mlp.in_features # e.g., 768
-                 print(f"Identified reward head: 'mlp' (expects input dim: {self.reward_head_in_dim})")
+             try: first_layer_of_mlp = self.reward_head.layers[0]; self.reward_head_in_dim = first_layer_of_mlp.in_features
              except Exception: raise AttributeError("Cannot get input dim for 'mlp' reward head.")
+             print(f"Identified reward head: 'mlp' (expects input dim: {self.reward_head_in_dim})")
         else: raise AttributeError("Cannot find 'mlp' reward head.")
 
-        # Trainable projection layer to map fused features to reward head input dimension
+        # Projection layer
         self.fusion_to_reward_proj = nn.Linear(intermediate_fusion_dim, self.reward_head_in_dim)
         print(f"Added projection layer: {intermediate_fusion_dim} -> {self.reward_head_in_dim}")
 
         # --- Freeze Parameters ---
-        # Freeze all parameters of the base model initially
+        # Freeze base model parameters FIRST
         for name, param in self.base_reward_model.named_parameters():
             param.requires_grad = False
-        # PEFT handles unfreezing LoRA layers within self.vision_encoder
-        # Unfreeze our custom layers
+            
+        # Unfreeze ONLY our custom layers and injected PEFT layers explicitly
+        # Note: Parameters within self.vision_encoder that are NOT LoRA layers will remain frozen.
         for param in self.timestep_embedding.parameters(): param.requires_grad = True
         for param in self.fusion_layer.parameters(): param.requires_grad = True
         for param in self.fusion_to_reward_proj.parameters(): param.requires_grad = True
-
-        # Keep original_reward_model completely frozen (already in eval mode)
-        for param in self.original_reward_model.parameters():
-             param.requires_grad = False
+        # Explicitly unfreeze LoRA params within the vision encoder (redundant if inject worked correctly, but safe)
+        for name, param in self.vision_encoder.named_parameters():
+             if 'lora' in name:
+                  param.requires_grad = True
+                  
+        # Freeze original_reward_model used for scoring
+        for param in self.original_reward_model.parameters(): param.requires_grad = False
 
         print("PEFTImageReward model configuration complete.")
+        # Calculate trainable params AFTER potentially unfreezing LoRA params again
         print(f"Total Trainable Params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
 
     def forward(self, image, timestep, input_ids, attention_mask):
         """ Forward pass including image, timestep, and tokenized text. """
-        # 1. Timestep Embedding: [B, timestep_dim]
         timestep_emb = self.timestep_embedding(timestep)
-
-        # 2. Image Features (via PEFT ViT): [B, vision_feature_dim]
-        # Process image using the base model's processor first
         if hasattr(self.base_reward_model, 'vis_processor'):
-            # Move image tensor to the device where vision_encoder expects it
             device = next(self.vision_encoder.parameters()).device
             processed_image = self.base_reward_model.vis_processor(image.to(device))
         else:
-             print("Warning: Cannot find base_reward_model.vis_processor.")
-             processed_image = image.to(next(self.vision_encoder.parameters()).device)
-        # Pass *only* pixel_values to the vision encoder
+             print("Warning: No vis_processor found."); processed_image = image.to(next(self.vision_encoder.parameters()).device)
+        # Now vision_encoder is the original module with LoRA layers injected, call normally
         vision_outputs = self.vision_encoder(pixel_values=processed_image)
         image_features = vision_outputs.pooler_output
-
-        # 3. Text Features (Frozen BERT + Frozen Proj): [B, text_feature_dim]
-        # Ensure text components are on the same device
-        device = image_features.device # Use device where image features ended up
-        text_output = self.text_encoder.to(device)(
-             input_ids=input_ids.to(device), attention_mask=attention_mask.to(device), return_dict=True
-        )
-        text_features = text_output.last_hidden_state[:, 0, :] # Use [CLS] token
-        projected_text_features = self.text_proj.to(device)(text_features)
-
-        # 4. Concatenate: [B, vision + time + text]
-        # Ensure all concatenated tensors are on the same device
-        combined_features = torch.cat([
-            image_features, 
-            timestep_emb.to(device), # Ensure timestep emb is on correct device
-            projected_text_features
-        ], dim=1)
-
-        # 5. Fuse features: [B, intermediate_fusion_dim]
+        device = image_features.device
+        text_output = self.text_encoder.to(device)(input_ids=input_ids.to(device), attention_mask=attention_mask.to(device), return_dict=True)
+        text_features = text_output.last_hidden_state[:, 0, :]; projected_text_features = self.text_proj.to(device)(text_features)
+        combined_features = torch.cat([image_features, timestep_emb.to(device), projected_text_features], dim=1)
         fused_features = self.fusion_layer(combined_features)
-
-        # 6. Project to reward head dim: [B, reward_head_in_dim]
         projected_features = self.fusion_to_reward_proj(fused_features)
-
-        # 7. Get reward score: [B, 1]
-        try:
-            # Ensure reward head is on the correct device
-            reward_score = self.reward_head.to(device)(projected_features)
+        try: reward_score = self.reward_head.to(device)(projected_features)
         except Exception as e: print(f"Error in reward head: {e}"); raise
         return reward_score
 
@@ -176,7 +161,7 @@ def plot_loss_to_terminal(steps, losses, width=80, title="Training Loss per Step
 
 def train(
     prompts_file="prompts.txt",
-    batch_size=4,
+    batch_size=1,
     learning_rate=1e-4,
     image_size=512,
     device="cuda" if torch.cuda.is_available() else "cpu",
