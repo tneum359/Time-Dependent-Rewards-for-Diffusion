@@ -112,20 +112,24 @@ class PEFTImageReward(nn.Module):
         """ Forward pass including image, timestep, and tokenized text. """
         timestep_emb = self.timestep_embedding(timestep)
         
+        # --- EDIT: Correctly locate and use vis_processor ---
         # Prepare image using the base model's processor first
-        if hasattr(self.base_reward_model, 'vis_processor'):
+        # The processor is likely nested under 'blip' like other components
+        if hasattr(self.base_reward_model, 'blip') and hasattr(self.base_reward_model.blip, 'vis_processor'):
+            vis_processor = self.base_reward_model.blip.vis_processor
             # Move image tensor to the device where vision_encoder expects it
             device = next(self.vision_encoder.parameters()).device
-            processed_image = self.base_reward_model.vis_processor(image.to(device))
+            # Apply the processor
+            processed_image = vis_processor(image.to(device))
+            print(f"Applied vis_processor. Processed image shape: {processed_image.shape}") # Debug print
         else:
-             # If no processor found, we should probably error or ensure image is correctly preprocessed elsewhere
-             print("Warning: Cannot find base_reward_model.vis_processor. Using raw image tensor - ensure it is correctly processed!")
-             processed_image = image.to(next(self.vision_encoder.parameters()).device)
+             # If no processor found, raise an error as processing is crucial
+             raise AttributeError("Cannot find base_reward_model.blip.vis_processor. Image processing is required.")
+             # processed_image = image.to(next(self.vision_encoder.parameters()).device) # Fallback removed - likely causes errors
+        # --- End EDIT ---
 
-        # --- EDIT: Call vision_encoder using POSITIONAL argument ---
         # Pass the processed image tensor directly as the first argument
         vision_outputs = self.vision_encoder(processed_image)
-        # --- End EDIT ---
         
         image_features = vision_outputs.pooler_output
         
