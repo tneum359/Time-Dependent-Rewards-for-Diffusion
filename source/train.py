@@ -231,9 +231,19 @@ def train(
             # Target rewards using the original model's score method
             with torch.no_grad():
                 model.original_reward_model.to(device).eval()
-                target_rewards_list = model.original_reward_model.score(prompts_text, final_images_pil)
-                if target_rewards_list is None: print(f"W: Skip step {global_step_counter}, None target"); continue
-                target_rewards = torch.tensor(target_rewards_list, device=device, dtype=torch.float32).unsqueeze(1)
+                target_rewards_output = model.original_reward_model.score(prompts_text, final_images_pil)
+                if target_rewards_output is None: print(f"W: Skip step {global_step_counter}, None target"); continue
+
+                # --- EDIT: Handle scalar or list return from score ---
+                # Ensure we have a list of scores before creating the tensor
+                if isinstance(target_rewards_output, list):
+                    target_rewards_list = target_rewards_output
+                else: # Assume scalar if not list
+                    target_rewards_list = [target_rewards_output] 
+
+                # Convert list (even if single item) to tensor and add dim
+                target_rewards = torch.tensor(target_rewards_list, device=device, dtype=torch.float32).unsqueeze(1) #[B, 1]
+                # --- End EDIT ---
 
             # Corrected Call: Pass required arguments to model
             predicted_rewards = model(intermediate_images, timesteps, input_ids, attention_mask)
