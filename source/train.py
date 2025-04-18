@@ -111,22 +111,45 @@ class PEFTImageReward(nn.Module):
     def forward(self, image, timestep, input_ids, attention_mask):
         """ Forward pass including image, timestep, and tokenized text. """
         timestep_emb = self.timestep_embedding(timestep)
+        
+        # Prepare image using the base model's processor first
         if hasattr(self.base_reward_model, 'vis_processor'):
+            # Move image tensor to the device where vision_encoder expects it
             device = next(self.vision_encoder.parameters()).device
             processed_image = self.base_reward_model.vis_processor(image.to(device))
         else:
-             print("Warning: No vis_processor found."); processed_image = image.to(next(self.vision_encoder.parameters()).device)
-        # Now vision_encoder is the original module with LoRA layers injected, call normally
-        vision_outputs = self.vision_encoder(pixel_values=processed_image)
+             # If no processor found, we should probably error or ensure image is correctly preprocessed elsewhere
+             print("Warning: Cannot find base_reward_model.vis_processor. Using raw image tensor - ensure it is correctly processed!")
+             processed_image = image.to(next(self.vision_encoder.parameters()).device)
+
+        # --- EDIT: Call vision_encoder using POSITIONAL argument ---
+        # Pass the processed image tensor directly as the first argument
+        vision_outputs = self.vision_encoder(processed_image)
+        # --- End EDIT ---
+        
         image_features = vision_outputs.pooler_output
-        device = image_features.device
-        text_output = self.text_encoder.to(device)(input_ids=input_ids.to(device), attention_mask=attention_mask.to(device), return_dict=True)
-        text_features = text_output.last_hidden_state[:, 0, :]; projected_text_features = self.text_proj.to(device)(text_features)
-        combined_features = torch.cat([image_features, timestep_emb.to(device), projected_text_features], dim=1)
+        
+        # --- Text Processing (remains the same) ---
+        device = image_features.device # Use device where image features ended up
+        text_output = self.text_encoder.to(device)(
+             input_ids=input_ids.to(device), attention_mask=attention_mask.to(device), return_dict=True
+        )
+        text_features = text_output.last_hidden_state[:, 0, :] # Use [CLS] token
+        projected_text_features = self.text_proj.to(device)(text_features)
+        # --- End Text Processing ---
+
+        # --- Fusion and Prediction (remains the same) ---
+        combined_features = torch.cat([
+            image_features, 
+            timestep_emb.to(device), 
+            projected_text_features
+        ], dim=1)
         fused_features = self.fusion_layer(combined_features)
         projected_features = self.fusion_to_reward_proj(fused_features)
         try: reward_score = self.reward_head.to(device)(projected_features)
         except Exception as e: print(f"Error in reward head: {e}"); raise
+        # --- End Fusion ---
+        
         return reward_score
 
 class TimestepEmbedding(nn.Module):
@@ -182,8 +205,9 @@ def train(
     try: model = PEFTImageReward(text_model_name=tokenizer_name).to(device)
     except Exception as e: print(f"ERROR: Failed to init model: {e}\n{traceback.format_exc()}"); return None
     print(f"Model loaded on device: {device}")
-
+    
     # Create dataloader
+    print(f"Loading data using prompts from: {prompts_file}")
     try:
         dataloader = load_diffusion_dataloader(
             prompts_file=prompts_file, batch_size=batch_size, image_size=image_size, shuffle=True, device=device
@@ -199,7 +223,7 @@ def train(
     print(f"Optimizing {len(trainable_params)} params ({sum(p.numel() for p in trainable_params):,} total).")
     optimizer = optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.01)
     loss_fn = nn.MSELoss()
-
+    
     # Metrics storage
     step_losses, global_steps_list = [], []; global_step_counter = 0
     print(f"Starting training for one pass ({num_steps} steps)... Plotting every {plot_every_n_steps} steps.")
@@ -252,7 +276,7 @@ def train(
             if predicted_rewards.shape != target_rewards.shape: print(f"W: Skip step {global_step_counter}, Shape mismatch"); continue
 
             loss = loss_fn(predicted_rewards, target_rewards)
-
+            
             optimizer.zero_grad(); loss.backward(); optimizer.step()
 
             batch_loss = loss.item(); total_loss_accum += batch_loss; batches_processed += 1
