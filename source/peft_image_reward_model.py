@@ -138,7 +138,7 @@ class PEFTImageReward(nn.Module):
              # --- End Debug --- 
 
              # 2. Preprocess SINGLE PIL image using the model's method
-             processed_intermediate_image = self.preprocess_image(img_pil) # Should return a tensor
+             processed_intermediate_image = self.base_reward_model.preprocess(img_pil) # Try calling directly
 
              # 3. Ensure processed tensor is on the correct device and add batch dim back
              # Assuming preprocess returns [C, 224, 224]
@@ -152,7 +152,7 @@ class PEFTImageReward(nn.Module):
 
         # 4. Get Image Features from PEFT-adapted Vision Encoder
         vision_outputs = self.vision_encoder(processed_intermediate_image) # Input should be [1, C, 224, 224]
-        image_features = vision_outputs.pooler_output # Use pooled output [1, D_vis]
+        image_features = vision_outputs[:, 0] # Use CLS token output [1, D_vis]
 
         # 3. Process Text (using frozen components)
         with torch.no_grad():
