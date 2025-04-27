@@ -40,7 +40,7 @@ class PEFTImageReward(nn.Module):
         self.text_feature_dim = self.text_proj.out_features
         print(f"Text Encoder & Projection found. Projected Text dim: {self.text_feature_dim}")
 
-        # Reward Head MLP (Will be adapted)
+        # Reward Head MLP (Frozen for now)
         if not hasattr(self.base_reward_model, 'mlp'):
              raise AttributeError("Cannot find 'mlp' reward head.")
         self.reward_head = self.base_reward_model.mlp
@@ -48,25 +48,12 @@ class PEFTImageReward(nn.Module):
         except Exception: raise AttributeError("Cannot get input dim for 'mlp' reward head.")
         print(f"Identified reward head: 'mlp' (expects input dim: {self.reward_head_in_dim})")
 
-        # --- Visual Processor (Crucial!) ---
-        self.vis_processor = None # Initialize to None
-        if hasattr(self.base_reward_model, 'vis_processor'):
-            self.vis_processor = self.base_reward_model.vis_processor
-            print("Found visual processor as 'vis_processor' directly on base model.")
-        elif hasattr(self.base_reward_model, 'image_processor'):
-            self.vis_processor = self.base_reward_model.image_processor
-            print("Found visual processor as 'image_processor' directly on base model.")
-        elif hasattr(self.base_reward_model, 'blip') and hasattr(self.base_reward_model.blip, 'vis_processor'):
-             self.vis_processor = self.base_reward_model.blip.vis_processor
-             print("Found visual processor as 'vis_processor' under 'blip'.")
-        elif hasattr(self.base_reward_model, 'blip') and hasattr(self.base_reward_model.blip, 'image_processor'):
-             self.vis_processor = self.base_reward_model.blip.image_processor
-             print("Found visual processor as 'image_processor' under 'blip'.")
-        # else:
-        #      # Temporarily comment out the error to see debug prints
-        #      # raise AttributeError("Cannot find base_reward_model's visual processor (checked multiple locations). Required for processing image.")
-        if self.vis_processor is None:
-            print("WARNING: Visual processor not found in expected locations. Will likely cause errors later.")
+        # --- Image Preprocessing Method (Crucial!) ---
+        if not hasattr(self.base_reward_model, 'preprocess'):
+             raise AttributeError("Cannot find 'preprocess' method on base_reward_model.")
+        self.preprocess_image = self.base_reward_model.preprocess
+        print("Found 'preprocess' method on base model.")
+        # --- End Preprocessing --- 
 
         # --- Trainable Components ---
         self.timestep_embedding = TimestepEmbedding(timestep_dim)
@@ -88,22 +75,26 @@ class PEFTImageReward(nn.Module):
         )
         print("Applying LoRA to Vision Encoder...")
         self.vision_encoder = inject_adapter_in_model(peft_config_vision, self.vision_encoder)
-        # self.vision_encoder.print_trainable_parameters() # Optional: print details
-
-        # MLP Head PEFT
-        peft_config_mlp = LoraConfig(
-            task_type=TaskType.SEQ_CLS, r=8, lora_alpha=16, lora_dropout=0.1,
-        )
-        print("Applying LoRA to MLP Reward Head...")
-        self.reward_head = get_peft_model(self.reward_head, peft_config_mlp)
-        # self.reward_head.print_trainable_parameters() # Optional: print details
-
+        
+        # MLP Head PEFT - REMOVED FOR NOW
+        # print("--- Debugging MLP Reward Head Structure ---")
+        # print(self.reward_head)
+        # print("--- End MLP Debug ---")
+        # mlp_target_modules = ["0", "2", "4", "6", "7"] # Based on debug output
+        # print(f"Attempting to target modules in MLP: {mlp_target_modules}")
+        # peft_config_mlp = LoraConfig(
+        #     task_type=TaskType.SEQ_CLS, r=8, lora_alpha=16, lora_dropout=0.1,
+        #     target_modules=mlp_target_modules 
+        # )
+        # print("Applying LoRA to MLP Reward Head...")
+        # self.reward_head = get_peft_model(self.reward_head, peft_config_mlp)
+        
         # --- Freeze Parameters --- 
-        # Freeze base model EXCEPT adapted layers' original weights (handled by PEFT)
+        # Freeze base model EXCEPT adapted vision encoder layers' original weights (handled by PEFT? No, inject doesn't handle base freezing)
         for name, param in self.base_reward_model.named_parameters():
             param.requires_grad = False
             
-        # Unfreeze custom layers and ensure LoRA adapters are trainable
+        # Unfreeze custom layers and Vision Encoder LoRA adapters
         for param in self.timestep_embedding.parameters(): param.requires_grad = True
         for param in self.fusion_layer.parameters(): param.requires_grad = True
         for param in self.fusion_to_reward_proj.parameters(): param.requires_grad = True
@@ -113,24 +104,40 @@ class PEFTImageReward(nn.Module):
              if 'lora' in name:
                   param.requires_grad = True
                   
-        # LoRA params in reward_head are handled by get_peft_model, should be trainable.
-        # Verify by checking requires_grad if needed.
+        # Ensure MLP head remains frozen for now
+        for param in self.reward_head.parameters():
+            param.requires_grad = False
 
         # Freeze original_reward_model used for scoring target
         for param in self.original_reward_model.parameters(): param.requires_grad = False
 
-        print("PEFTImageReward model configuration complete (Vision + MLP adapted).")
+        print("PEFTImageReward model configuration complete (Vision Encoder adapted).") # Updated message
         print(f"Total Trainable Params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
 
     def forward(self, intermediate_image, timestep, input_ids, attention_mask):
-        """ Forward pass using intermediate image, timestep, and text. Adapts Vision+MLP. """
-        # 1. Process Intermediate Image using found processor
-        device = next(self.parameters()).device # Use device where model parameters are
-        processed_intermediate_image = self.vis_processor(intermediate_image.to(device))
-        # print(f"Processed intermediate shape: {processed_intermediate_image.shape}") # Debug shape
-
+        """ Forward pass using preprocessed intermediate image, timestep, and text. Adapts Vision Encoder. """
+        # 1. Process Intermediate Image using the model's preprocess method
+        # We need to handle the device placement and potential arguments/return format carefully.
+        # Assuming preprocess takes image (PIL or Tensor?) and returns a tensor for the encoder.
+        # Let's try passing the tensor and moving it to device first.
+        device = next(self.parameters()).device 
+        try:
+             # Convert tensor to PIL first? The score method takes PIL. Let's assume preprocess does too.
+             # This assumes intermediate_image is a batch [B, C, H, W] on CPU
+             intermediate_image_pil = [to_pil_image(img) for img in intermediate_image.cpu()]
+             # Preprocess the batch of PIL images
+             # What does preprocess return? A tensor on CPU? GPU? Need to check.
+             # Assume it returns a tensor ready for the model, possibly on CPU.
+             processed_intermediate_image = self.preprocess_image(intermediate_image_pil)
+             # Ensure it's on the correct device for the vision encoder
+             processed_intermediate_image = processed_intermediate_image.to(device)
+             print(f"Preprocessed intermediate image shape: {processed_intermediate_image.shape}") # Debug
+        except Exception as e:
+             print(f"ERROR calling self.preprocess_image: {e}")
+             print("Ensure input format (PIL?) and return format are handled correctly.")
+             raise
+        
         # 2. Get Image Features from PEFT-adapted Vision Encoder
-        # No need for torch.no_grad() here as vision_encoder has trainable LoRA layers
         vision_outputs = self.vision_encoder(processed_intermediate_image)
         image_features = vision_outputs.pooler_output # Use pooled output [B, D_vis]
 
@@ -143,7 +150,7 @@ class PEFTImageReward(nn.Module):
             projected_text_features = self.text_proj.to(device)(text_features) # [B, D_text_proj]
 
         # 4. Get Timestep Embedding (trainable)
-        timestep_emb = self.timestep_embedding(timestep) # [B, D_ts]
+        timestep_emb = self.timestep_embedding(timestep.to(device)) # Ensure timestep is on device
 
         # 5. Fuse Features (trainable layers)
         combined_features = torch.cat([
@@ -156,8 +163,9 @@ class PEFTImageReward(nn.Module):
         # 6. Project to Reward Head Input Dimension (trainable layer)
         projected_features = self.fusion_to_reward_proj(fused_features) # [B, D_reward_in]
 
-        # 7. Pass through Adapted Reward Head MLP (trainable adapters)
-        reward_score = self.reward_head(projected_features)
+        # 7. Pass through ORIGINAL Reward Head MLP (frozen)
+        with torch.no_grad():
+             reward_score = self.reward_head(projected_features)
 
         return reward_score
 
