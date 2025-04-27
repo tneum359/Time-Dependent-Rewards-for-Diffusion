@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import ImageReward as reward
 from peft import LoraConfig, TaskType, inject_adapter_in_model, get_peft_model
+from torchvision.transforms.functional import to_pil_image
 
 class PEFTImageReward(nn.Module):
     def __init__(self, base_model_path="ImageReward-v1.0", timestep_dim=320, text_model_name="roberta-base"):

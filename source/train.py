@@ -41,6 +41,8 @@ def plot_loss_to_terminal(steps, losses, width=80, title="Training Loss per Step
     except Exception as e: print(f"Failed to generate terminal plot: {e}\n{traceback.format_exc()}")
 
 def train(
+    model: PEFTImageReward, 
+    flux_pipe: FluxPipeline,
     prompts_file="prompts.txt",
     batch_size=1,
     learning_rate=1e-4,
@@ -51,64 +53,25 @@ def train(
     tokenizer_name="roberta-base",
     max_prompt_length=77
 ):
+    # --- Ensure models are on the correct device (passed models might be on CPU) ---
+    try:
+        model.to(device)
+        # Flux pipe should already be loaded with offload enabled, 
+        # but we ensure its core components expected on GPU are there.
+        # This might be implicitly handled by offload, but can be explicit if needed.
+        # flux_pipe.to(device) # Typically enable_model_cpu_offload handles this
+    except Exception as e:
+        print(f"ERROR moving models passed as arguments to device '{device}': {e}")
+        return None
+    # --- End Ensure Device ---
+    
     os.makedirs(checkpoint_dir, exist_ok=True)
     print(f"Checkpoints directory: {checkpoint_dir}")
 
-    # Load Tokenizer
+    # Load Tokenizer (Keep this here, it's fast)
     try: tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     except Exception as e: print(f"ERROR: Failed to load tokenizer '{tokenizer_name}': {e}"); return None
     print(f"Tokenizer '{tokenizer_name}' loaded.")
-
-    # Create model (using imported class)
-    try: 
-        print("Loading PEFTImageReward model to device...")
-        model = PEFTImageReward(text_model_name=tokenizer_name).to(device)
-        print(f"PEFTImageReward model loaded on device: {device}")
-    except Exception as e: 
-        print(f"ERROR: Failed to init model: {e}\n{traceback.format_exc()}"); return None
-    
-    # --- Temporarily Move Reward Model to CPU to free VRAM for Flux --- 
-    try:
-        print("Moving PEFTImageReward model temporarily to CPU...")
-        model.to('cpu')
-        print("Attempting to clear CUDA cache before loading Flux pipeline...")
-        torch.cuda.empty_cache() 
-    except Exception as e:
-        print(f"Warning: Error moving model to CPU or clearing cache: {e}")
-        # Continue anyway, maybe it wasn't necessary
-    # --- End Temporary Move ---
-
-    # --- Load Diffusion Pipeline (Moved here) ---
-    flux_pipe = None
-    flux_model_name="black-forest-labs/FLUX.1-dev"
-    try:
-        # Cache was cleared above
-        print(f"Loading Flux pipeline ({flux_model_name}) to device: {device}...")
-        pipeline_dtype = torch.bfloat16 if torch.device(device).type == 'cuda' else torch.float32
-        print(f"Using dtype: {pipeline_dtype}")
-        flux_pipe = FluxPipeline.from_pretrained(
-            flux_model_name,
-            torch_dtype=pipeline_dtype,
-        ).to(device)
-        flux_pipe.enable_model_cpu_offload()
-        print("Flux pipeline loaded and configured with model CPU offload.")
-    except Exception as e:
-        print(f"ERROR: Failed to load Flux pipeline: {e}\n{traceback.format_exc()}")
-        # Try to move the reward model back to GPU even if Flux failed, just in case
-        try: model.to(device); print("Moved PEFTImageReward model back to GPU after Flux load failure.")
-        except Exception: pass
-        return None
-    # --- End Load Diffusion Pipeline ---
-
-    # --- Move Reward Model back to GPU --- 
-    try:
-        print("Moving PEFTImageReward model back to GPU...")
-        model.to(device)
-        print("PEFTImageReward model back on GPU.")
-    except Exception as e:
-        print(f"ERROR: Failed to move PEFTImageReward model back to GPU: {e}\n{traceback.format_exc()}")
-        return None # Critical failure
-    # --- End Move Back ---
 
     # --- Load Prompts Directly ---
     prompts = []
@@ -204,7 +167,7 @@ def train(
                 intermediate_image_tensor = None
                 if intermediate_latents is not None:
                     # Move latents to target device (necessary if offloading happened)
-                    latents_to_process = intermediate_latents.to(device, dtype=pipeline_dtype)
+                    latents_to_process = intermediate_latents.to(device, dtype=flux_pipe.dtype)
 
                     # Unpack/Reshape (copied from old dataloader)
                     latent_channels = flux_pipe.vae.config.latent_channels
@@ -333,14 +296,86 @@ def train(
     return model
 
 if __name__ == "__main__":
+    # --- This block now needs to perform the setup and model loading --- 
+    print("--- Running Train Script Directly (Setup & Training) ---")
+    
+    # --- Configuration --- 
     prompts_file_path = "prompts.txt"
-    # Create dummy prompts.txt if it doesn't exist, for testing
+    batch_size=1
+    plot_every_n_steps=1
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer_name="roberta-base"
+    # Add other necessary configs like lr, image_size, checkpoint_dir if needed by train()
+    learning_rate = 1e-4 
+    image_size = 512
+    checkpoint_dir = "checkpoints"
+    max_prompt_length = 77
+    
+    # --- Create Dummy Prompts --- 
     if not os.path.exists(prompts_file_path):
         print(f"INFO: {prompts_file_path} not found. Creating a dummy file with one prompt.")
         with open(prompts_file_path, 'w') as f:
             f.write("a photograph of an astronaut riding a horse\n")
-            
-    # Removed explicit device setting here, function defaults handle it
-    # Set batch_size=1 explicitly for now, as generation loop processes one by one
-    train(prompts_file=prompts_file_path, plot_every_n_steps=1, batch_size=1) 
+
+    # --- Load Models (SLOW PART) --- 
+    loaded_model = None
+    loaded_flux_pipe = None
+
+    # Load PEFT Model
+    try: 
+        print("Loading PEFTImageReward model...")
+        # Load initially to CPU potentially to manage memory during sequential load
+        loaded_model = PEFTImageReward(text_model_name=tokenizer_name) 
+        print(f"PEFTImageReward model loaded initially.")
+    except Exception as e: 
+        print(f"ERROR: Failed to init model: {e}\n{traceback.format_exc()}"); exit()
+    
+    # Temporarily Move Reward Model to CPU (redundant if loaded to CPU, but ensures state)
+    try:
+        print("Ensuring PEFTImageReward model is on CPU...")
+        loaded_model.to('cpu')
+        print("Attempting to clear CUDA cache before loading Flux pipeline...")
+        torch.cuda.empty_cache() 
+    except Exception as e:
+        print(f"Warning: Error moving model to CPU or clearing cache: {e}")
+        
+    # Load Flux Pipeline 
+    flux_model_name="black-forest-labs/FLUX.1-dev"
+    try:
+        print(f"Loading Flux pipeline ({flux_model_name}) to device: {device}...")
+        pipeline_dtype = torch.bfloat16 if torch.device(device).type == 'cuda' else torch.float32
+        print(f"Using dtype: {pipeline_dtype}")
+        loaded_flux_pipe = FluxPipeline.from_pretrained(
+            flux_model_name,
+            torch_dtype=pipeline_dtype,
+        ).to(device)
+        loaded_flux_pipe.enable_model_cpu_offload()
+        print("Flux pipeline loaded and configured with model CPU offload.")
+    except Exception as e:
+        print(f"ERROR: Failed to load Flux pipeline: {e}\n{traceback.format_exc()}"); exit()
+
+    # Move Reward Model back to GPU 
+    try:
+        print("Moving PEFTImageReward model to GPU...")
+        loaded_model.to(device)
+        print("PEFTImageReward model on GPU.")
+    except Exception as e:
+        print(f"ERROR: Failed to move PEFTImageReward model to GPU: {e}\n{traceback.format_exc()}"); exit()
+    
+    # --- Call Training Function --- 
+    print("\n--- Starting Training --- ")
+    train(
+        model=loaded_model,
+        flux_pipe=loaded_flux_pipe,
+        prompts_file=prompts_file_path, 
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        image_size=image_size,
+        device=device,
+        checkpoint_dir=checkpoint_dir,
+        plot_every_n_steps=plot_every_n_steps,
+        tokenizer_name=tokenizer_name,
+        max_prompt_length=max_prompt_length
+    ) 
+    print("--- Training Script Finished ---")
 
