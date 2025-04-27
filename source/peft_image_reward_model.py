@@ -94,30 +94,21 @@ class PEFTImageReward(nn.Module):
         """ Forward pass including image, timestep, and tokenized text. """
         timestep_emb = self.timestep_embedding(timestep)
 
-        # --- EDIT: Check for vis_processor OR image_processor under blip ---
-        vis_processor = None
-        # Prepare image using the base model's processor first
-        if hasattr(self.base_reward_model, 'blip'):
-            if hasattr(self.base_reward_model.blip, 'vis_processor'):
-                vis_processor = self.base_reward_model.blip.vis_processor
-                print("Found processor as 'vis_processor' under 'blip'.") # Debug
-            elif hasattr(self.base_reward_model.blip, 'image_processor'): # Check alternative name
-                vis_processor = self.base_reward_model.blip.image_processor
-                print("Found processor as 'image_processor' under 'blip'.") # Debug
+        # --- Removed Processor Logic --- 
+        # Attempting to pass image tensor directly - EXPECTING SIZE MISMATCH ERROR
+        device = next(self.vision_encoder.parameters()).device
+        processed_image = image.to(device) 
+        # --- End Removed Logic --- 
 
-        if vis_processor:
-            # Move image tensor to the device where vision_encoder expects it
-            device = next(self.vision_encoder.parameters()).device
-            # Apply the processor
-            processed_image = vis_processor(image.to(device))
-            print(f"Applied processor. Processed image shape: {processed_image.shape}") # Debug print
-        else:
-             # If no processor found after checking common names/locations, raise an error
-             raise AttributeError("Cannot find base_reward_model's visual processor (checked blip.vis_processor, blip.image_processor). Image processing is required.")
-        # --- End EDIT ---
-
-        # Pass the processed image tensor directly as the first argument
-        vision_outputs = self.vision_encoder(processed_image)
+        # Pass the image tensor directly as the first argument
+        # This will likely fail due to size mismatch (e.g., 512 vs 224)
+        # or type mismatch if the base ViT expects PIL images internally.
+        try:
+            vision_outputs = self.vision_encoder(processed_image)
+        except Exception as e:
+            print(f"ERROR calling vision_encoder directly: {e}")
+            print("This likely confirms direct tensor input requires specific preprocessing not accessible here.")
+            raise
 
         image_features = vision_outputs.pooler_output
 
