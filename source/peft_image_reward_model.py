@@ -158,7 +158,10 @@ class PEFTImageReward(nn.Module):
         with torch.no_grad():
              # Assuming input_ids/attention_mask are already [1, SeqLen]
             text_output = self.text_encoder.to(device)(
-                input_ids=input_ids.to(device), attention_mask=attention_mask.to(device), return_dict=True
+                input_ids=input_ids.to(device), 
+                attention_mask=attention_mask.to(device), 
+                encoder_hidden_states=None, # Tell the encoder we are not providing cross-attention states
+                return_dict=True
             )
             text_features = text_output.last_hidden_state[:, 0, :] # Use [CLS] token [1, D_text_raw]
             projected_text_features = self.text_proj.to(device)(text_features) # [1, D_text_proj]
