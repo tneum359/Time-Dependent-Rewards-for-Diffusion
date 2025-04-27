@@ -270,15 +270,16 @@ def train(
             input_ids = tokenized_prompts["input_ids"].to(device)
             attention_mask = tokenized_prompts["attention_mask"].to(device)
 
-            # Move images and timesteps to device (intermediate_images is now the generated one)
-            intermediate_images = intermediate_images_cpu.to(device)
+            # --- EDIT: Move FINAL images and timesteps to device for model input ---
+            final_images = final_images_cpu.to(device)
             timesteps = timesteps_cpu.to(device)
-            # final_images_gpu = final_images_cpu.to(device) # Only needed if used below
+            # intermediate_images are now only needed for calculating the loss target? No, target uses final PIL.
+            # So intermediate_images_cpu aren't used further in this setup.
 
-            # Convert final images (already on CPU) to PIL for score method
+            # Convert final images (already on CPU) to PIL for score method (target reward)
             final_images_pil = [to_pil_image(img.to(torch.float32)) for img in final_images_cpu]
 
-            # Target rewards using the original model's score method
+            # Target rewards using the original model's score method (on FINAL images)
             with torch.no_grad():
                 model.original_reward_model.to(device).eval()
                 target_rewards_output = model.original_reward_model.score(prompts_text, final_images_pil)
@@ -295,11 +296,13 @@ def train(
                 target_rewards = torch.tensor(target_rewards_list, device=device, dtype=torch.float32).unsqueeze(1) #[B, 1]
                 # --- End EDIT ---
 
-            # Corrected Call: Pass required arguments to model
-            predicted_rewards = model(intermediate_images, timesteps, input_ids, attention_mask)
+            # Corrected Call: Pass INTERMEDIATE image tensor, timesteps, and text tokens to model
+            predicted_rewards = model(intermediate_images_cpu, timesteps_cpu, input_ids, attention_mask)
 
             if predicted_rewards is None: print(f"W: Skip step {global_step_counter}, None prediction"); continue
-            if predicted_rewards.shape != target_rewards.shape: print(f"W: Skip step {global_step_counter}, Shape mismatch"); continue
+            if predicted_rewards.shape != target_rewards.shape: 
+                print(f"W: Skip step {global_step_counter}, Shape mismatch. Predicted: {predicted_rewards.shape}, Target: {target_rewards.shape}"); 
+                continue
 
             loss = loss_fn(predicted_rewards, target_rewards)
             
