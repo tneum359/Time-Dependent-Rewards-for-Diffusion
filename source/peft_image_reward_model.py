@@ -40,6 +40,24 @@ class PEFTImageReward(nn.Module):
         self.text_proj = self.base_reward_model.blip.text_proj
         self.text_feature_dim = self.text_proj.out_features
         print(f"Text Encoder & Projection found. Projected Text dim: {self.text_feature_dim}")
+        # --- Debug Text Encoder Config ---
+        try:
+            print("--- Debugging Text Encoder Config ---")
+            if hasattr(self.text_encoder, 'config'):
+                 print(self.text_encoder.config)
+                 # Potentially try modifying the config here if a relevant flag is found
+                 # if hasattr(self.text_encoder.config, 'is_decoder') and self.text_encoder.config.is_decoder:
+                 #      print("Attempting to set is_decoder = False")
+                 #      self.text_encoder.config.is_decoder = False
+                 # if hasattr(self.text_encoder.config, 'add_cross_attention') and self.text_encoder.config.add_cross_attention:
+                 #      print("Attempting to set add_cross_attention = False")
+                 #      self.text_encoder.config.add_cross_attention = False
+            else:
+                 print("Text encoder does not have a .config attribute.")
+            print("--- End Text Encoder Config Debug ---")
+        except Exception as e:
+            print(f"Error inspecting text encoder config: {e}")
+        # --- End Debug ---
 
         # Reward Head MLP (Frozen for now)
         if not hasattr(self.base_reward_model, 'mlp'):
