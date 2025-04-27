@@ -123,13 +123,16 @@ class PEFTImageReward(nn.Module):
         # Let's try passing the tensor and moving it to device first.
         device = next(self.parameters()).device 
         try:
-             # Convert tensor to PIL first? The score method takes PIL. Let's assume preprocess does too.
-             # This assumes intermediate_image is a batch [B, C, H, W] on CPU
-             intermediate_image_pil = [to_pil_image(img.to(torch.float32)) for img in intermediate_image.cpu()]
-             # Preprocess the batch of PIL images
-             # What does preprocess return? A tensor on CPU? GPU? Need to check.
-             # Assume it returns a tensor ready for the model, possibly on CPU.
-             processed_intermediate_image = self.preprocess_image(intermediate_image_pil)
+             # Convert tensor batch to list of PIL images (float32)
+             intermediate_image_float_cpu = intermediate_image.cpu().to(torch.float32)
+             intermediate_image_pil = [to_pil_image(img) for img in intermediate_image_float_cpu]
+             
+             # --- EDIT: Apply preprocess to each image individually --- 
+             processed_images_list = [self.preprocess_image(pil_img) for pil_img in intermediate_image_pil]
+             # Stack the list of processed tensors into a batch
+             processed_intermediate_image = torch.stack(processed_images_list)
+             # --- End EDIT --- 
+
              # Ensure it's on the correct device for the vision encoder
              processed_intermediate_image = processed_intermediate_image.to(device)
              print(f"Preprocessed intermediate image shape: {processed_intermediate_image.shape}") # Debug
