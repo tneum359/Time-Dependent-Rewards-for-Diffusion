@@ -123,22 +123,20 @@ class PEFTImageReward(nn.Module):
         # Let's try passing the tensor and moving it to device first.
         device = next(self.parameters()).device 
         try:
-             # Convert tensor batch to list of PIL images (float32)
-             intermediate_image_float_cpu = intermediate_image.cpu().to(torch.float32)
-             intermediate_image_pil = [to_pil_image(img) for img in intermediate_image_float_cpu]
+             # --- EDIT: Pass tensor batch directly to preprocess --- 
+             # Ensure the input tensor is float32 and on the correct device
+             intermediate_image_float_device = intermediate_image.to(device, dtype=torch.float32)
              
-             # --- EDIT: Apply preprocess to each image individually --- 
-             processed_images_list = [self.preprocess_image(pil_img) for pil_img in intermediate_image_pil]
-             # Stack the list of processed tensors into a batch
-             processed_intermediate_image = torch.stack(processed_images_list)
+             # Call preprocess with the tensor batch
+             processed_intermediate_image = self.preprocess_image(intermediate_image_float_device)
              # --- End EDIT --- 
 
-             # Ensure it's on the correct device for the vision encoder
+             # Ensure it's on the correct device after preprocessing (it might change)
              processed_intermediate_image = processed_intermediate_image.to(device)
              print(f"Preprocessed intermediate image shape: {processed_intermediate_image.shape}") # Debug
         except Exception as e:
              print(f"ERROR calling self.preprocess_image: {e}")
-             print("Ensure input format (PIL?) and return format are handled correctly.")
+             print("Ensure input format (Tensor batch?) and return format are handled correctly.")
              raise
         
         # 2. Get Image Features from PEFT-adapted Vision Encoder
