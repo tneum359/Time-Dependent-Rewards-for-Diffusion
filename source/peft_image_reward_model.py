@@ -119,6 +119,10 @@ class PEFTImageReward(nn.Module):
         """ Forward pass using preprocessed intermediate image, timestep, and text. Adapts Vision Encoder. """
         device = next(self.parameters()).device 
         
+        # --- Debug --- 
+        print(f"[DEBUG] Intermediate image input shape: {intermediate_image.shape}")
+        # --- End Debug --- 
+        
         # Ensure intermediate_image is a single image tensor [C, H, W] (assuming batch_size=1)
         if intermediate_image.shape[0] != 1:
             raise ValueError(f"This forward pass currently assumes batch_size=1, but got batch size {intermediate_image.shape[0]}")
@@ -128,6 +132,10 @@ class PEFTImageReward(nn.Module):
         try:
              # 1. Convert SINGLE tensor to PIL
              img_pil = to_pil_image(img_tensor_cpu)
+             # --- Debug --- 
+             print(f"[DEBUG] Type of img_pil: {type(img_pil)}")
+             print(f"[DEBUG] Type of self.preprocess_image: {type(self.preprocess_image)}")
+             # --- End Debug --- 
 
              # 2. Preprocess SINGLE PIL image using the model's method
              processed_intermediate_image = self.preprocess_image(img_pil) # Should return a tensor
