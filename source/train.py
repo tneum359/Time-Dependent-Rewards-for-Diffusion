@@ -68,6 +68,8 @@ def train(
     flux_pipe = None
     flux_model_name="black-forest-labs/FLUX.1-dev"
     try:
+        print("Attempting to clear CUDA cache before loading Flux pipeline...")
+        torch.cuda.empty_cache()
         print(f"Loading Flux pipeline ({flux_model_name}) to device: {device}...")
         pipeline_dtype = torch.bfloat16 if torch.device(device).type == 'cuda' else torch.float32
         print(f"Using dtype: {pipeline_dtype}")
