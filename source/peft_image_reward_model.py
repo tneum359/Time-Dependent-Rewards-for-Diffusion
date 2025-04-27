@@ -117,57 +117,62 @@ class PEFTImageReward(nn.Module):
 
     def forward(self, intermediate_image, timestep, input_ids, attention_mask):
         """ Forward pass using preprocessed intermediate image, timestep, and text. Adapts Vision Encoder. """
-        # 1. Process Intermediate Image using the model's preprocess method
-        # We need to handle the device placement and potential arguments/return format carefully.
-        # Assuming preprocess takes image (PIL or Tensor?) and returns a tensor for the encoder.
-        # Let's try passing the tensor and moving it to device first.
         device = next(self.parameters()).device 
-        try:
-             # --- EDIT: Pass tensor batch directly to preprocess --- 
-             # Ensure the input tensor is float32 and on the correct device
-             intermediate_image_float_device = intermediate_image.to(device, dtype=torch.float32)
-             
-             # Call preprocess with the tensor batch
-             processed_intermediate_image = self.preprocess_image(intermediate_image_float_device)
-             # --- End EDIT --- 
-
-             # Ensure it's on the correct device after preprocessing (it might change)
-             processed_intermediate_image = processed_intermediate_image.to(device)
-             print(f"Preprocessed intermediate image shape: {processed_intermediate_image.shape}") # Debug
-        except Exception as e:
-             print(f"ERROR calling self.preprocess_image: {e}")
-             print("Ensure input format (Tensor batch?) and return format are handled correctly.")
-             raise
         
-        # 2. Get Image Features from PEFT-adapted Vision Encoder
-        vision_outputs = self.vision_encoder(processed_intermediate_image)
-        image_features = vision_outputs.pooler_output # Use pooled output [B, D_vis]
+        # Ensure intermediate_image is a single image tensor [C, H, W] (assuming batch_size=1)
+        if intermediate_image.shape[0] != 1:
+            raise ValueError(f"This forward pass currently assumes batch_size=1, but got batch size {intermediate_image.shape[0]}")
+        
+        img_tensor_cpu = intermediate_image.squeeze(0).cpu().to(torch.float32) # Remove batch dim, move to CPU, ensure float32
+            
+        try:
+             # 1. Convert SINGLE tensor to PIL
+             img_pil = to_pil_image(img_tensor_cpu)
+
+             # 2. Preprocess SINGLE PIL image using the model's method
+             processed_intermediate_image = self.preprocess_image(img_pil) # Should return a tensor
+
+             # 3. Ensure processed tensor is on the correct device and add batch dim back
+             # Assuming preprocess returns [C, 224, 224]
+             processed_intermediate_image = processed_intermediate_image.unsqueeze(0).to(device)
+             print(f"Preprocessed intermediate image shape: {processed_intermediate_image.shape}") # Debug
+
+        except Exception as e:
+             print(f"ERROR during preprocessing: {e}")
+             print("Check input/output of self.preprocess_image on single PIL.")
+             raise
+
+        # 4. Get Image Features from PEFT-adapted Vision Encoder
+        vision_outputs = self.vision_encoder(processed_intermediate_image) # Input should be [1, C, 224, 224]
+        image_features = vision_outputs.pooler_output # Use pooled output [1, D_vis]
 
         # 3. Process Text (using frozen components)
         with torch.no_grad():
+             # Assuming input_ids/attention_mask are already [1, SeqLen]
             text_output = self.text_encoder.to(device)(
                 input_ids=input_ids.to(device), attention_mask=attention_mask.to(device), return_dict=True
             )
-            text_features = text_output.last_hidden_state[:, 0, :] # Use [CLS] token [B, D_text_raw]
-            projected_text_features = self.text_proj.to(device)(text_features) # [B, D_text_proj]
+            text_features = text_output.last_hidden_state[:, 0, :] # Use [CLS] token [1, D_text_raw]
+            projected_text_features = self.text_proj.to(device)(text_features) # [1, D_text_proj]
 
         # 4. Get Timestep Embedding (trainable)
-        timestep_emb = self.timestep_embedding(timestep.to(device)) # Ensure timestep is on device
+        timestep_emb = self.timestep_embedding(timestep.to(device)) # Ensure timestep is on device [1, D_ts]
 
         # 5. Fuse Features (trainable layers)
+        # Ensure all features have batch dim 1
         combined_features = torch.cat([
-            image_features.to(timestep_emb.device), # Ensure devices match for cat
-            timestep_emb, 
+            image_features.to(timestep_emb.device), 
+            timestep_emb,
             projected_text_features.to(timestep_emb.device)
-        ], dim=1)
-        fused_features = self.fusion_layer(combined_features) # [B, D_inter_fusion]
-        
+        ], dim=1) # Should be [1, D_vis + D_ts + D_text_proj]
+        fused_features = self.fusion_layer(combined_features) # [1, D_inter_fusion]
+
         # 6. Project to Reward Head Input Dimension (trainable layer)
-        projected_features = self.fusion_to_reward_proj(fused_features) # [B, D_reward_in]
+        projected_features = self.fusion_to_reward_proj(fused_features) # [1, D_reward_in]
 
         # 7. Pass through ORIGINAL Reward Head MLP (frozen)
         with torch.no_grad():
-             reward_score = self.reward_head(projected_features)
+             reward_score = self.reward_head(projected_features) # [1, 1] or [1]
 
         return reward_score
 
