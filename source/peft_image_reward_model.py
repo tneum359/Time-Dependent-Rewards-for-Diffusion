@@ -11,6 +11,18 @@ class PEFTImageReward(nn.Module):
         self.original_reward_model = reward.load(base_model_path)
         self.original_reward_model.eval()
 
+        # --- Debug: Inspect the loaded base_reward_model --- 
+        print("--- Debugging base_reward_model --- ")
+        try:
+            print(f"Type: {type(self.base_reward_model)}")
+            print(f"Attributes/Methods: {dir(self.base_reward_model)}")
+            if hasattr(self.base_reward_model, 'blip'):
+                 print(f"BLIP component attributes: {dir(self.base_reward_model.blip)}")
+        except Exception as e:
+            print(f"Error during debug inspection: {e}")
+        print("--- End Debugging --- ")
+        # --- End Debug ---
+
         # --- References to Base Model Components ---
         # Vision Encoder (Will be adapted)
         if not hasattr(self.base_reward_model, 'blip') or not hasattr(self.base_reward_model.blip, 'visual_encoder'):
@@ -37,6 +49,7 @@ class PEFTImageReward(nn.Module):
         print(f"Identified reward head: 'mlp' (expects input dim: {self.reward_head_in_dim})")
 
         # --- Visual Processor (Crucial!) ---
+        self.vis_processor = None # Initialize to None
         if hasattr(self.base_reward_model, 'vis_processor'):
             self.vis_processor = self.base_reward_model.vis_processor
             print("Found visual processor as 'vis_processor' directly on base model.")
@@ -49,8 +62,11 @@ class PEFTImageReward(nn.Module):
         elif hasattr(self.base_reward_model, 'blip') and hasattr(self.base_reward_model.blip, 'image_processor'):
              self.vis_processor = self.base_reward_model.blip.image_processor
              print("Found visual processor as 'image_processor' under 'blip'.")
-        else:
-             raise AttributeError("Cannot find base_reward_model's visual processor (checked multiple locations). Required for processing image.")
+        # else:
+        #      # Temporarily comment out the error to see debug prints
+        #      # raise AttributeError("Cannot find base_reward_model's visual processor (checked multiple locations). Required for processing image.")
+        if self.vis_processor is None:
+            print("WARNING: Visual processor not found in expected locations. Will likely cause errors later.")
 
         # --- Trainable Components ---
         self.timestep_embedding = TimestepEmbedding(timestep_dim)
