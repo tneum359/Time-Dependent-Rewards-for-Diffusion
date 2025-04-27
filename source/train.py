@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from peft import get_peft_model, LoraConfig, TaskType, inject_adapter_in_model
 import sys
 import os
 import matplotlib.pyplot as plt
@@ -11,168 +10,17 @@ import io
 from PIL import Image
 import numpy as np
 import traceback
+import random # Added for random step selection
 from torchvision.transforms.functional import to_pil_image
 from transformers import AutoTokenizer, logging as hf_logging
+from diffusers import FluxPipeline # Added FluxPipeline import
 
 # Suppress tokenizer warnings about legacy behavior
 hf_logging.set_verbosity_error()
 
 # Add parent directory path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__) if __file__ else '.', '..')))
-from source.timedep_dataloader import load_diffusion_dataloader # Assumes dataloader returns (final_img, inter_img, ts, prompt_str)
-
-class PEFTImageReward(nn.Module):
-    def __init__(self, base_model_path="ImageReward-v1.0", timestep_dim=320, text_model_name="roberta-base"):
-        super().__init__()
-        print(f"Initializing PEFTImageReward - Base: {base_model_path}")
-        self.base_reward_model = reward.load(base_model_path)
-        self.original_reward_model = reward.load(base_model_path)
-        self.original_reward_model.eval()
-
-        # Access visual_encoder via 'blip'
-        if not hasattr(self.base_reward_model, 'blip') or not hasattr(self.base_reward_model.blip, 'visual_encoder'):
-            raise AttributeError("Cannot find '.blip.visual_encoder'.")
-        # Keep the reference to the original encoder
-        self.vision_encoder = self.base_reward_model.blip.visual_encoder
-        print("Identified vision component as '.blip.visual_encoder'")
-
-        # Get vision feature dimension
-        self.vision_feature_dim = self.vision_encoder.embed_dim if hasattr(self.vision_encoder, 'embed_dim') else self.vision_encoder.config.hidden_size
-        print(f"Vision feature dimension: {self.vision_feature_dim}")
-
-        # Text Encoder & Projection (Keep references, remain frozen)
-        if not hasattr(self.base_reward_model.blip, 'text_encoder') or not hasattr(self.base_reward_model.blip, 'text_proj'):
-             raise AttributeError("Cannot find '.blip.text_encoder' or '.blip.text_proj'.")
-        self.text_encoder = self.base_reward_model.blip.text_encoder
-        self.text_proj = self.base_reward_model.blip.text_proj
-        self.text_feature_dim = self.text_proj.out_features
-        print(f"Text Encoder & Projection found. Projected Text dim: {self.text_feature_dim}")
-
-        # Timestep Embedding
-        self.timestep_embedding = TimestepEmbedding(timestep_dim)
-        print(f"Timestep Embedding dim: {timestep_dim}")
-
-        # Fusion Layer (Inputs: Vision + Time + Text)
-        total_fused_dim = self.vision_feature_dim + timestep_dim + self.text_feature_dim
-        intermediate_fusion_dim = self.vision_feature_dim
-        self.fusion_layer = nn.Linear(total_fused_dim, intermediate_fusion_dim)
-        print(f"Fusion layer input dim: {total_fused_dim}, output dim: {intermediate_fusion_dim}")
-
-        # --- Define PEFT configuration ---
-        peft_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION, r=16, lora_alpha=32, lora_dropout=0.1,
-            target_modules=["qkv", "proj"]
-        )
-
-        # --- EDIT: Inject Adapters instead of wrapping ---
-        # Apply PEFT by injecting adapters directly into self.vision_encoder
-        self.vision_encoder = inject_adapter_in_model(peft_config, self.vision_encoder)
-        # Mark adapters as trainable after injection (might be needed depending on peft version)
-        for name, param in self.vision_encoder.named_parameters():
-             if 'lora' in name:
-                  param.requires_grad = True
-        print(f"PEFT adapters injected into vision_encoder.")
-        # --- End EDIT ---
-
-        # Identify the reward head MLP
-        if hasattr(self.base_reward_model, 'mlp'):
-             self.reward_head = self.base_reward_model.mlp
-             try: first_layer_of_mlp = self.reward_head.layers[0]; self.reward_head_in_dim = first_layer_of_mlp.in_features
-             except Exception: raise AttributeError("Cannot get input dim for 'mlp' reward head.")
-             print(f"Identified reward head: 'mlp' (expects input dim: {self.reward_head_in_dim})")
-        else: raise AttributeError("Cannot find 'mlp' reward head.")
-
-        # Projection layer
-        self.fusion_to_reward_proj = nn.Linear(intermediate_fusion_dim, self.reward_head_in_dim)
-        print(f"Added projection layer: {intermediate_fusion_dim} -> {self.reward_head_in_dim}")
-
-        # --- Freeze Parameters ---
-        # Freeze base model parameters FIRST
-        for name, param in self.base_reward_model.named_parameters():
-            param.requires_grad = False
-            
-        # Unfreeze ONLY our custom layers and injected PEFT layers explicitly
-        # Note: Parameters within self.vision_encoder that are NOT LoRA layers will remain frozen.
-        for param in self.timestep_embedding.parameters(): param.requires_grad = True
-        for param in self.fusion_layer.parameters(): param.requires_grad = True
-        for param in self.fusion_to_reward_proj.parameters(): param.requires_grad = True
-        # Explicitly unfreeze LoRA params within the vision encoder (redundant if inject worked correctly, but safe)
-        for name, param in self.vision_encoder.named_parameters():
-             if 'lora' in name:
-                  param.requires_grad = True
-                  
-        # Freeze original_reward_model used for scoring
-        for param in self.original_reward_model.parameters(): param.requires_grad = False
-
-        print("PEFTImageReward model configuration complete.")
-        # Calculate trainable params AFTER potentially unfreezing LoRA params again
-        print(f"Total Trainable Params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
-
-    def forward(self, image, timestep, input_ids, attention_mask):
-        """ Forward pass including image, timestep, and tokenized text. """
-        timestep_emb = self.timestep_embedding(timestep)
-        
-        # --- EDIT: Check for vis_processor OR image_processor under blip ---
-        vis_processor = None
-        # Prepare image using the base model's processor first
-        if hasattr(self.base_reward_model, 'blip'):
-            if hasattr(self.base_reward_model.blip, 'vis_processor'):
-                vis_processor = self.base_reward_model.blip.vis_processor
-                print("Found processor as 'vis_processor' under 'blip'.") # Debug
-            elif hasattr(self.base_reward_model.blip, 'image_processor'): # Check alternative name
-                vis_processor = self.base_reward_model.blip.image_processor
-                print("Found processor as 'image_processor' under 'blip'.") # Debug
-
-        if vis_processor:
-            # Move image tensor to the device where vision_encoder expects it
-            device = next(self.vision_encoder.parameters()).device
-            # Apply the processor
-            processed_image = vis_processor(image.to(device))
-            print(f"Applied processor. Processed image shape: {processed_image.shape}") # Debug print
-        else:
-             # If no processor found after checking common names/locations, raise an error
-             raise AttributeError("Cannot find base_reward_model's visual processor (checked blip.vis_processor, blip.image_processor). Image processing is required.")
-        # --- End EDIT ---
-
-        # Pass the processed image tensor directly as the first argument
-        vision_outputs = self.vision_encoder(processed_image)
-        
-        image_features = vision_outputs.pooler_output
-        
-        # --- Text Processing (remains the same) ---
-        device = image_features.device # Use device where image features ended up
-        text_output = self.text_encoder.to(device)(
-             input_ids=input_ids.to(device), attention_mask=attention_mask.to(device), return_dict=True
-        )
-        text_features = text_output.last_hidden_state[:, 0, :] # Use [CLS] token
-        projected_text_features = self.text_proj.to(device)(text_features)
-        # --- End Text Processing ---
-
-        # --- Fusion and Prediction (remains the same) ---
-        combined_features = torch.cat([
-            image_features, 
-            timestep_emb.to(device), 
-            projected_text_features
-        ], dim=1)
-        fused_features = self.fusion_layer(combined_features)
-        projected_features = self.fusion_to_reward_proj(fused_features)
-        try: reward_score = self.reward_head.to(device)(projected_features)
-        except Exception as e: print(f"Error in reward head: {e}"); raise
-        # --- End Fusion ---
-        
-        return reward_score
-
-class TimestepEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__(); self.dim = dim
-        self.proj = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
-    def forward(self, timestep):
-        half_dim = self.dim // 2; timestep = timestep.float() / 1000.0
-        freqs = torch.exp(-torch.arange(half_dim, device=timestep.device) * torch.log(torch.tensor(10000.0)) / half_dim)
-        timestep = timestep.view(-1, 1); freqs = freqs.view(1, -1); args = timestep * freqs
-        embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        if self.dim % 2 == 1: embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return self.proj(embedding)
+from source.peft_image_reward_model import PEFTImageReward # Import model
 
 def plot_loss_to_terminal(steps, losses, width=80, title="Training Loss per Step"):
     if not steps or not losses or len(steps) != len(losses): print("Plotting skipped: Invalid data."); return
@@ -211,21 +59,60 @@ def train(
     except Exception as e: print(f"ERROR: Failed to load tokenizer '{tokenizer_name}': {e}"); return None
     print(f"Tokenizer '{tokenizer_name}' loaded.")
 
-    # Create model
+    # Create model (using imported class)
     try: model = PEFTImageReward(text_model_name=tokenizer_name).to(device)
     except Exception as e: print(f"ERROR: Failed to init model: {e}\n{traceback.format_exc()}"); return None
     print(f"Model loaded on device: {device}")
     
-    # Create dataloader
-    print(f"Loading data using prompts from: {prompts_file}")
+    # --- Load Diffusion Pipeline (Moved here) ---
+    flux_pipe = None
+    flux_model_name="black-forest-labs/FLUX.1-dev"
     try:
-        dataloader = load_diffusion_dataloader(
-            prompts_file=prompts_file, batch_size=batch_size, image_size=image_size, shuffle=True, device=device
-        )
-        dataset_size = len(dataloader.dataset); num_steps = len(dataloader)
-        if dataset_size == 0: raise ValueError("Dataloader empty.")
-        print(f"Data loaded. Size: {dataset_size}. Steps/Pass: {num_steps}")
-    except Exception as e: print(f"ERROR: Failed to load dataloader: {e}\n{traceback.format_exc()}"); return None
+        print(f"Loading Flux pipeline ({flux_model_name}) to device: {device}...")
+        pipeline_dtype = torch.bfloat16 if torch.device(device).type == 'cuda' else torch.float32
+        print(f"Using dtype: {pipeline_dtype}")
+        flux_pipe = FluxPipeline.from_pretrained(
+            flux_model_name,
+            torch_dtype=pipeline_dtype,
+        ).to(device)
+        flux_pipe.enable_model_cpu_offload()
+        print("Flux pipeline loaded and configured with model CPU offload.")
+    except Exception as e:
+        print(f"ERROR: Failed to load Flux pipeline: {e}\n{traceback.format_exc()}")
+        return None
+    # --- End Load Diffusion Pipeline ---
+
+    # --- Load Prompts Directly ---
+    prompts = []
+    try:
+        # Check paths for prompts file
+        script_dir = os.path.dirname(__file__) if '__file__' in locals() else '.' # Handle case where script is run directly
+        paths_to_check = [
+            prompts_file,
+            os.path.join(script_dir, prompts_file),
+            os.path.join(script_dir, '..', prompts_file)
+        ]
+        found_path = None
+        for path in paths_to_check:
+             if os.path.exists(path):
+                  found_path = path
+                  break
+        if found_path is None:
+             raise FileNotFoundError(f"Prompts file not found in checked paths: {paths_to_check}")
+        prompts_file = found_path # Use the found path
+
+        with open(prompts_file, 'r') as f:
+            prompts = [line.strip() for line in f if line.strip()]
+        if not prompts:
+             raise ValueError(f"No valid prompts found in {prompts_file}")
+        print(f"Loaded {len(prompts)} prompts directly from {prompts_file}")
+    except Exception as e: 
+        print(f"ERROR: Failed to load prompts: {e}\n{traceback.format_exc()}")
+        return None
+    dataset_size = len(prompts)
+    num_steps = (dataset_size + batch_size - 1) // batch_size # Calculate steps based on batch size
+    print(f"Data loaded. Size: {dataset_size}. Calculated Steps/Pass: {num_steps}")
+    # --- End Load Prompts --- 
 
     # Setup Optimizer & Loss
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -240,12 +127,113 @@ def train(
 
     model.train(); total_loss_accum, batches_processed = 0.0, 0
 
-    for i, batch_data in enumerate(dataloader):
+    # The dataloader now yields batches of prompt strings
+    # Loop directly over prompts, creating batches manually
+    for i in range(0, dataset_size, batch_size):
         global_step_counter += 1
+        prompts_text_batch = prompts[i:min(i + batch_size, dataset_size)]
+        current_batch_size = len(prompts_text_batch) # Actual size of this batch
+        if not prompts_text_batch: continue # Skip if somehow empty
+        
         try:
-            final_images_cpu, intermediate_images_cpu, timesteps_cpu, prompts_text = batch_data
+            # --- Generate Images On-the-fly --- 
+            batch_final_images_cpu = []
+            batch_intermediate_images_cpu = []
+            batch_timesteps_cpu = []
+            num_inference_steps = 30 # Define inference steps
 
-            # Tokenize Prompts
+            # Process each prompt in the batch individually (simplest approach for now)
+            for prompt_text in prompts_text_batch:
+                random_step = random.randint(1, num_inference_steps - 1)
+                captured_timestep = torch.tensor(random_step) # Keep on CPU for now
+                intermediate_latents = None
+
+                # Define callback within the loop to capture intermediate latents
+                def capture_callback(pipe, step, timestep, callback_kwargs):
+                    nonlocal intermediate_latents
+                    if step == random_step:
+                        # Capture latents (will be on pipeline's compute device, likely GPU)
+                        intermediate_latents = callback_kwargs["latents"].detach().clone()
+                    return callback_kwargs
+
+                # Generate image using the single pipeline instance
+                with torch.no_grad():
+                    # Note: For batch size > 1, ideally call pipeline once per batch.
+                    # Current loop processes prompts individually, might be inefficient.
+                    # Consider batching the flux_pipe call if performance is critical.
+                    output = flux_pipe(
+                        prompt=prompt_text, height=image_size, width=image_size,
+                        guidance_scale=3.5, num_inference_steps=num_inference_steps,
+                        max_sequence_length=512, output_type="pt", # Get PyTorch tensors
+                        callback_on_step_end=capture_callback,
+                        callback_on_step_end_tensor_inputs=["latents"]
+                    )
+                # Need to ensure final_image_tensor has batch dim if batch_size > 1 was intended here
+                # If output.images is already [B, C, H, W] for batch prompts, adjust indexing
+                final_image_tensor = output.images[0] # Assumes output.images is [C, H, W] for single prompt
+
+                # Decode intermediate latents (if captured)
+                intermediate_image_tensor = None
+                if intermediate_latents is not None:
+                    # Move latents to target device (necessary if offloading happened)
+                    latents_to_process = intermediate_latents.to(device, dtype=pipeline_dtype)
+
+                    # Unpack/Reshape (copied from old dataloader)
+                    latent_channels = flux_pipe.vae.config.latent_channels
+                    latent_height = image_size // 8; latent_width = image_size // 8
+                    expected_shape = (1, latent_channels, latent_height, latent_width)
+                    numel_expected = 1 * latent_channels * latent_height * latent_width
+                    if hasattr(flux_pipe, "_unpack_latents"): # Check if unpack method exists
+                        try:
+                            vae_scale_factor = 2 ** (len(flux_pipe.vae.config.block_out_channels) - 1)
+                            latents_to_process = flux_pipe._unpack_latents(latents_to_process, image_size, image_size, vae_scale_factor)
+                        except Exception as unpack_e:
+                            if latents_to_process.numel() == numel_expected: latents_to_process = latents_to_process.reshape(expected_shape)
+                            else: raise ValueError(f"Cannot unpack/reshape {latents_to_process.shape} to {expected_shape}.") from unpack_e
+                    elif latents_to_process.numel() == numel_expected:
+                        latents_to_process = latents_to_process.reshape(expected_shape)
+                    else: raise ValueError(f"Cannot reshape {latents_to_process.shape} to {expected_shape}.")
+
+                    # Inverse Scale & Shift 
+                    scaling_factor = flux_pipe.vae.config.scaling_factor
+                    shift_factor = getattr(flux_pipe.vae.config, "shift_factor", 0.0)
+                    latents_for_decode = latents_to_process / scaling_factor + shift_factor
+                    
+                    # VAE Decode
+                    with torch.no_grad():
+                         # Ensure VAE is on the correct device (may need .to(device))
+                        decoded_output = flux_pipe.vae.decode(latents_for_decode.to(flux_pipe.vae.dtype), return_dict=False)
+                        decoded_image_tensor = decoded_output[0]
+                    
+                    # Post-process
+                    intermediate_image = flux_pipe.image_processor.postprocess(decoded_image_tensor, output_type="pt")
+                    if isinstance(intermediate_image, list): intermediate_image = intermediate_image[0]
+                    if intermediate_image.dim() == 4 and intermediate_image.shape[0] == 1: intermediate_image = intermediate_image.squeeze(0)
+                    intermediate_image_tensor = intermediate_image # Shape [C, H, W]
+
+                else:
+                     print(f"W: Intermediate latents not captured for step {global_step_counter}. Using final image.")
+                     intermediate_image_tensor = final_image_tensor.clone()
+                
+                # Append results for this prompt to the batch lists (move to CPU)
+                batch_final_images_cpu.append(final_image_tensor.cpu())
+                batch_intermediate_images_cpu.append(intermediate_image_tensor.cpu())
+                batch_timesteps_cpu.append(captured_timestep.cpu()) # Timestep was already CPU
+                
+            # --- End Generate Images On-the-fly ---
+            
+            # --- Create Batches from generated data ---
+            if not batch_final_images_cpu:
+                print(f"W: Skipping step {global_step_counter}, no images generated for batch."); continue
+
+            final_images_cpu = torch.stack(batch_final_images_cpu) # Shape [B, C, H, W]
+            intermediate_images_cpu = torch.stack(batch_intermediate_images_cpu) # Shape [B, C, H, W]
+            timesteps_cpu = torch.stack(batch_timesteps_cpu) # Shape [B]
+            # prompts_text is already prompts_text_batch (List[str])
+            prompts_text = prompts_text_batch 
+            # --- End Create Batches --- 
+
+            # Tokenize Prompts (prompts_text is now the batch list)
             tokenized_prompts = tokenizer(
                 prompts_text, padding="max_length", truncation=True,
                 max_length=max_prompt_length, return_tensors="pt"
@@ -254,12 +242,12 @@ def train(
             input_ids = tokenized_prompts["input_ids"].to(device)
             attention_mask = tokenized_prompts["attention_mask"].to(device)
 
-            # Move images and timesteps to device
+            # Move images and timesteps to device (intermediate_images is now the generated one)
             intermediate_images = intermediate_images_cpu.to(device)
             timesteps = timesteps_cpu.to(device)
-            final_images_gpu = final_images_cpu.to(device) # For potential use by score method
+            # final_images_gpu = final_images_cpu.to(device) # Only needed if used below
 
-            # Convert final images to PIL for score method (run on CPU tensors)
+            # Convert final images (already on CPU) to PIL for score method
             final_images_pil = [to_pil_image(img.to(torch.float32)) for img in final_images_cpu]
 
             # Target rewards using the original model's score method
@@ -290,6 +278,7 @@ def train(
             optimizer.zero_grad(); loss.backward(); optimizer.step()
 
             batch_loss = loss.item(); total_loss_accum += batch_loss; batches_processed += 1
+            # Note: global_steps_list uses the batch index, not individual image index
             step_losses.append(batch_loss); global_steps_list.append(global_step_counter)
 
             # Plotting Condition
@@ -314,6 +303,13 @@ def train(
 
 if __name__ == "__main__":
     prompts_file_path = "prompts.txt"
-    if not os.path.exists(prompts_file_path): print(f"ERROR: {prompts_file_path} not found.")
-    else: train(prompts_file=prompts_file_path, plot_every_n_steps=1) # Set plotting frequency here
+    # Create dummy prompts.txt if it doesn't exist, for testing
+    if not os.path.exists(prompts_file_path):
+        print(f"INFO: {prompts_file_path} not found. Creating a dummy file with one prompt.")
+        with open(prompts_file_path, 'w') as f:
+            f.write("a photograph of an astronaut riding a horse\n")
+            
+    # Removed explicit device setting here, function defaults handle it
+    # Set batch_size=1 explicitly for now, as generation loop processes one by one
+    train(prompts_file=prompts_file_path, plot_every_n_steps=1, batch_size=1) 
 
