@@ -125,7 +125,7 @@ class PEFTImageReward(nn.Module):
         try:
              # Convert tensor to PIL first? The score method takes PIL. Let's assume preprocess does too.
              # This assumes intermediate_image is a batch [B, C, H, W] on CPU
-             intermediate_image_pil = [to_pil_image(img) for img in intermediate_image.cpu()]
+             intermediate_image_pil = [to_pil_image(img.to(torch.float32)) for img in intermediate_image.cpu()]
              # Preprocess the batch of PIL images
              # What does preprocess return? A tensor on CPU? GPU? Need to check.
              # Assume it returns a tensor ready for the model, possibly on CPU.
