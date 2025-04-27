@@ -60,16 +60,29 @@ def train(
     print(f"Tokenizer '{tokenizer_name}' loaded.")
 
     # Create model (using imported class)
-    try: model = PEFTImageReward(text_model_name=tokenizer_name).to(device)
-    except Exception as e: print(f"ERROR: Failed to init model: {e}\n{traceback.format_exc()}"); return None
-    print(f"Model loaded on device: {device}")
+    try: 
+        print("Loading PEFTImageReward model to device...")
+        model = PEFTImageReward(text_model_name=tokenizer_name).to(device)
+        print(f"PEFTImageReward model loaded on device: {device}")
+    except Exception as e: 
+        print(f"ERROR: Failed to init model: {e}\n{traceback.format_exc()}"); return None
     
+    # --- Temporarily Move Reward Model to CPU to free VRAM for Flux --- 
+    try:
+        print("Moving PEFTImageReward model temporarily to CPU...")
+        model.to('cpu')
+        print("Attempting to clear CUDA cache before loading Flux pipeline...")
+        torch.cuda.empty_cache() 
+    except Exception as e:
+        print(f"Warning: Error moving model to CPU or clearing cache: {e}")
+        # Continue anyway, maybe it wasn't necessary
+    # --- End Temporary Move ---
+
     # --- Load Diffusion Pipeline (Moved here) ---
     flux_pipe = None
     flux_model_name="black-forest-labs/FLUX.1-dev"
     try:
-        print("Attempting to clear CUDA cache before loading Flux pipeline...")
-        torch.cuda.empty_cache()
+        # Cache was cleared above
         print(f"Loading Flux pipeline ({flux_model_name}) to device: {device}...")
         pipeline_dtype = torch.bfloat16 if torch.device(device).type == 'cuda' else torch.float32
         print(f"Using dtype: {pipeline_dtype}")
@@ -81,8 +94,21 @@ def train(
         print("Flux pipeline loaded and configured with model CPU offload.")
     except Exception as e:
         print(f"ERROR: Failed to load Flux pipeline: {e}\n{traceback.format_exc()}")
+        # Try to move the reward model back to GPU even if Flux failed, just in case
+        try: model.to(device); print("Moved PEFTImageReward model back to GPU after Flux load failure.")
+        except Exception: pass
         return None
     # --- End Load Diffusion Pipeline ---
+
+    # --- Move Reward Model back to GPU --- 
+    try:
+        print("Moving PEFTImageReward model back to GPU...")
+        model.to(device)
+        print("PEFTImageReward model back on GPU.")
+    except Exception as e:
+        print(f"ERROR: Failed to move PEFTImageReward model back to GPU: {e}\n{traceback.format_exc()}")
+        return None # Critical failure
+    # --- End Move Back ---
 
     # --- Load Prompts Directly ---
     prompts = []
