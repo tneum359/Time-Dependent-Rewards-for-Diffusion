@@ -3,6 +3,7 @@ import torch.nn as nn
 import ImageReward as reward
 from peft import LoraConfig, TaskType, inject_adapter_in_model, get_peft_model
 from torchvision.transforms.functional import to_pil_image
+from transformers import AutoModel
 
 class PEFTImageReward(nn.Module):
     def __init__(self, base_model_path="ImageReward-v1.0", timestep_dim=320, text_model_name="roberta-base"):
@@ -33,34 +34,19 @@ class PEFTImageReward(nn.Module):
         self.vision_feature_dim = self.vision_encoder.embed_dim if hasattr(self.vision_encoder, 'embed_dim') else self.vision_encoder.config.hidden_size
         print(f"Vision feature dimension: {self.vision_feature_dim}")
 
-        # Text Encoder & Projection (Frozen)
-        if not hasattr(self.base_reward_model.blip, 'text_encoder') or not hasattr(self.base_reward_model.blip, 'text_proj'):
-             raise AttributeError("Cannot find '.blip.text_encoder' or '.blip.text_proj'.")
-        self.text_encoder = self.base_reward_model.blip.text_encoder
+        # --- EDIT: Use Standalone Text Encoder --- 
+        # Text Projection Layer (Frozen - from original model)
+        if not hasattr(self.base_reward_model.blip, 'text_proj'):
+             raise AttributeError("Cannot find '.blip.text_proj'.")
         self.text_proj = self.base_reward_model.blip.text_proj
-        self.text_feature_dim = self.text_proj.out_features
-        print(f"Text Encoder & Projection found. Projected Text dim: {self.text_feature_dim}")
-        # --- Debug Text Encoder Config ---
-        try:
-            print("--- Debugging Text Encoder Config ---")
-            if hasattr(self.text_encoder, 'config'):
-                 print(self.text_encoder.config)
-                 # Potentially try modifying the config here if a relevant flag is found
-                 # if hasattr(self.text_encoder.config, 'is_decoder') and self.text_encoder.config.is_decoder:
-                 #      print("Attempting to set is_decoder = False")
-                 #      self.text_encoder.config.is_decoder = False
-                 # --- EDIT: Modify config --- 
-                 if hasattr(self.text_encoder.config, 'add_cross_attention') and self.text_encoder.config.add_cross_attention:
-                      print("Attempting to set add_cross_attention = False")
-                      self.text_encoder.config.add_cross_attention = False
-                      print(f"Config updated: add_cross_attention = {self.text_encoder.config.add_cross_attention}")
-                 # --- End EDIT --- 
-            else:
-                 print("Text encoder does not have a .config attribute.")
-            print("--- End Text Encoder Config Debug ---")
-        except Exception as e:
-            print(f"Error inspecting text encoder config: {e}")
-        # --- End Debug ---
+        self.text_feature_dim = self.text_proj.out_features # This is the *projected* dim
+        print(f"Using original Text Projection Layer. Projected Text dim: {self.text_feature_dim}")
+
+        # Load Standalone Text Encoder (Frozen)
+        print(f"Loading standalone text encoder: {text_model_name}")
+        self.standalone_text_encoder = AutoModel.from_pretrained(text_model_name)
+        self.standalone_text_encoder.eval() # Set to eval mode
+        # --- End EDIT --- 
 
         # Reward Head MLP (Frozen for now)
         if not hasattr(self.base_reward_model, 'mlp'):
@@ -98,30 +84,21 @@ class PEFTImageReward(nn.Module):
         print("Applying LoRA to Vision Encoder...")
         self.vision_encoder = inject_adapter_in_model(peft_config_vision, self.vision_encoder)
         
-        # MLP Head PEFT - REMOVED FOR NOW
-        # print("--- Debugging MLP Reward Head Structure ---")
-        # print(self.reward_head)
-        # print("--- End MLP Debug ---")
-        # mlp_target_modules = ["0", "2", "4", "6", "7"] # Based on debug output
-        # print(f"Attempting to target modules in MLP: {mlp_target_modules}")
-        # peft_config_mlp = LoraConfig(
-        #     task_type=TaskType.SEQ_CLS, r=8, lora_alpha=16, lora_dropout=0.1,
-        #     target_modules=mlp_target_modules 
-        # )
-        # print("Applying LoRA to MLP Reward Head...")
-        # self.reward_head = get_peft_model(self.reward_head, peft_config_mlp)
-        
         # --- Freeze Parameters --- 
-        # Freeze base model EXCEPT adapted vision encoder layers' original weights (handled by PEFT? No, inject doesn't handle base freezing)
+        # Freeze base model EXCEPT adapted vision encoder layers' original weights
         for name, param in self.base_reward_model.named_parameters():
             param.requires_grad = False
             
+        # Freeze the standalone text encoder
+        for param in self.standalone_text_encoder.parameters():
+             param.requires_grad = False
+
         # Unfreeze custom layers and Vision Encoder LoRA adapters
         for param in self.timestep_embedding.parameters(): param.requires_grad = True
         for param in self.fusion_layer.parameters(): param.requires_grad = True
         for param in self.fusion_to_reward_proj.parameters(): param.requires_grad = True
         
-        # Explicitly unfreeze LoRA params in vision_encoder (inject_adapter_in_model might not set requires_grad)
+        # Explicitly unfreeze LoRA params in vision_encoder
         for name, param in self.vision_encoder.named_parameters():
              if 'lora' in name:
                   param.requires_grad = True
@@ -133,7 +110,7 @@ class PEFTImageReward(nn.Module):
         # Freeze original_reward_model used for scoring target
         for param in self.original_reward_model.parameters(): param.requires_grad = False
 
-        print("PEFTImageReward model configuration complete (Vision Encoder adapted).") # Updated message
+        print("PEFTImageReward model configuration complete (Vision Encoder adapted, Standalone Text Encoder).") # Updated message
         print(f"Total Trainable Params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
 
     def forward(self, intermediate_image, timestep, input_ids, attention_mask):
@@ -175,17 +152,20 @@ class PEFTImageReward(nn.Module):
         vision_outputs = self.vision_encoder(processed_intermediate_image) # Input should be [1, C, 224, 224]
         image_features = vision_outputs[:, 0] # Use CLS token output [1, D_vis]
 
-        # 3. Process Text (using frozen components)
+        # --- EDIT: Use Standalone Text Encoder --- 
+        # 3. Process Text (using standalone frozen encoder and original projection)
         with torch.no_grad():
              # Assuming input_ids/attention_mask are already [1, SeqLen]
-            text_output = self.text_encoder.to(device)(
-                input_ids=input_ids.to(device), 
-                attention_mask=attention_mask.to(device), 
-                encoder_hidden_states=None, # Tell the encoder we are not providing cross-attention states
-                return_dict=True
-            )
-            text_features = text_output.last_hidden_state[:, 0, :] # Use [CLS] token [1, D_text_raw]
-            projected_text_features = self.text_proj.to(device)(text_features) # [1, D_text_proj]
+             standalone_text_output = self.standalone_text_encoder.to(device)(
+                 input_ids=input_ids.to(device),
+                 attention_mask=attention_mask.to(device),
+                 return_dict=True
+             )
+             # Use CLS token from the standalone encoder output
+             text_features = standalone_text_output.last_hidden_state[:, 0, :] 
+             # Pass through the original model's frozen projection layer
+             projected_text_features = self.text_proj.to(device)(text_features)
+        # --- End EDIT --- 
 
         # 4. Get Timestep Embedding (trainable)
         timestep_emb = self.timestep_embedding(timestep.to(device)) # Ensure timestep is on device [1, D_ts]
