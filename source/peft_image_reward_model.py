@@ -103,9 +103,9 @@ class PEFTImageReward(nn.Module):
              if 'lora' in name:
                   param.requires_grad = True
                   
-        # Ensure MLP head remains frozen for now
-        for param in self.reward_head.parameters():
-            param.requires_grad = False
+        # Ensure MLP head remains frozen for now - EDIT: Unfreeze to allow grad flow
+        # for param in self.reward_head.parameters():
+        #     param.requires_grad = False
 
         # Freeze original_reward_model used for scoring target
         for param in self.original_reward_model.parameters(): param.requires_grad = False
