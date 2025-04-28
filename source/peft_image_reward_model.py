@@ -49,9 +49,12 @@ class PEFTImageReward(nn.Module):
                  # if hasattr(self.text_encoder.config, 'is_decoder') and self.text_encoder.config.is_decoder:
                  #      print("Attempting to set is_decoder = False")
                  #      self.text_encoder.config.is_decoder = False
-                 # if hasattr(self.text_encoder.config, 'add_cross_attention') and self.text_encoder.config.add_cross_attention:
-                 #      print("Attempting to set add_cross_attention = False")
-                 #      self.text_encoder.config.add_cross_attention = False
+                 # --- EDIT: Modify config --- 
+                 if hasattr(self.text_encoder.config, 'add_cross_attention') and self.text_encoder.config.add_cross_attention:
+                      print("Attempting to set add_cross_attention = False")
+                      self.text_encoder.config.add_cross_attention = False
+                      print(f"Config updated: add_cross_attention = {self.text_encoder.config.add_cross_attention}")
+                 # --- End EDIT --- 
             else:
                  print("Text encoder does not have a .config attribute.")
             print("--- End Text Encoder Config Debug ---")
