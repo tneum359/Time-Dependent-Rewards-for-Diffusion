@@ -85,7 +85,7 @@ class PEFTImageReward(nn.Module):
         self.vision_encoder = inject_adapter_in_model(peft_config_vision, self.vision_encoder)
         
         # --- Freeze Parameters --- 
-        # Freeze base model EXCEPT adapted vision encoder layers' original weights
+        # Freeze base model first
         for name, param in self.base_reward_model.named_parameters():
             param.requires_grad = False
             
@@ -93,21 +93,23 @@ class PEFTImageReward(nn.Module):
         for param in self.standalone_text_encoder.parameters():
              param.requires_grad = False
 
-        # Unfreeze custom layers and Vision Encoder LoRA adapters
+        # --- Unfreeze selected components --- 
+        # Unfreeze custom layers 
         for param in self.timestep_embedding.parameters(): param.requires_grad = True
         for param in self.fusion_layer.parameters(): param.requires_grad = True
         for param in self.fusion_to_reward_proj.parameters(): param.requires_grad = True
         
-        # Explicitly unfreeze LoRA params in vision_encoder
+        # Unfreeze LoRA params in vision_encoder (already done by PEFT but explicit)
         for name, param in self.vision_encoder.named_parameters():
              if 'lora' in name:
                   param.requires_grad = True
                   
-        # Ensure MLP head remains frozen for now - EDIT: Unfreeze to allow grad flow
-        # for param in self.reward_head.parameters():
-        #     param.requires_grad = False
+        # Unfreeze Reward Head MLP (it was frozen by the base_reward_model loop above)
+        print("Explicitly unfreezing reward_head MLP parameters...")
+        for param in self.reward_head.parameters():
+             param.requires_grad = True
 
-        # Freeze original_reward_model used for scoring target
+        # Keep original_reward_model used for scoring target frozen
         for param in self.original_reward_model.parameters(): param.requires_grad = False
 
         print("PEFTImageReward model configuration complete (Vision Encoder adapted, Standalone Text Encoder).") # Updated message
@@ -148,9 +150,10 @@ class PEFTImageReward(nn.Module):
              print("Check input/output of self.preprocess_image on single PIL.")
              raise
 
-        # 4. Get Image Features from PEFT-adapted Vision Encoder
+        # 2. Get Image Features from PEFT-adapted Vision Encoder
         vision_outputs = self.vision_encoder(processed_intermediate_image) # Input should be [1, C, 224, 224]
         image_features = vision_outputs[:, 0] # Use CLS token output [1, D_vis]
+        print(f"[DEBUG FORWARD] image_features.requires_grad: {image_features.requires_grad}") # <-- DEBUG GRAD
 
         # --- EDIT: Use Standalone Text Encoder --- 
         # 3. Process Text (using standalone frozen encoder and original projection)
@@ -168,23 +171,27 @@ class PEFTImageReward(nn.Module):
         # --- End EDIT --- 
 
         # 4. Get Timestep Embedding (trainable)
-        timestep_emb = self.timestep_embedding(timestep.to(device)) # Ensure timestep is on device [1, D_ts]
+        timestep_emb = self.timestep_embedding(timestep.to(device)) # [1, D_ts]
+        print(f"[DEBUG FORWARD] timestep_emb.requires_grad: {timestep_emb.requires_grad}") # <-- DEBUG GRAD
 
         # 5. Fuse Features (trainable layers)
-        # Ensure all features have batch dim 1
+        # Concatenate along the feature dimension (dim=1)
+        # Ensure projected_text_features is expanded if needed (though it should be [1, D_text_proj])
         combined_features = torch.cat([
-            image_features.to(timestep_emb.device), 
-            timestep_emb,
-            projected_text_features.to(timestep_emb.device)
-        ], dim=1) # Should be [1, D_vis + D_ts + D_text_proj]
-        fused_features = self.fusion_layer(combined_features) # [1, D_inter_fusion]
+            image_features,                 # [1, D_vis]
+            projected_text_features,        # [1, D_text_proj]
+            timestep_emb                    # [1, D_ts]
+        ], dim=1) # Result shape [1, D_vis + D_text_proj + D_ts]
+        fused_features = self.fusion_layer(combined_features) # [1, D_fusion_out]
+        print(f"[DEBUG FORWARD] fused_features.requires_grad: {fused_features.requires_grad}") # <-- DEBUG GRAD
 
         # 6. Project to Reward Head Input Dimension (trainable layer)
-        projected_features = self.fusion_to_reward_proj(fused_features) # [1, D_reward_in]
+        fused_features_projected = self.fusion_to_reward_proj(fused_features) # [1, D_mlp_in]
+        print(f"[DEBUG FORWARD] fused_features_projected.requires_grad: {fused_features_projected.requires_grad}") # <-- DEBUG GRAD
 
         # 7. Pass through ORIGINAL Reward Head MLP (frozen)
-        with torch.no_grad():
-             reward_score = self.reward_head(projected_features) # [1, 1] or [1]
+        reward_score = self.reward_head(fused_features_projected) # [1, 1]
+        print(f"[DEBUG FORWARD] reward_score.requires_grad: {reward_score.requires_grad}") # <-- DEBUG GRAD
 
         return reward_score
 
