@@ -125,8 +125,8 @@ class PEFTImageReward(nn.Module):
         # --- End Debug --- 
         
         # 1. Process Image Batch
-        # Ensure input is on the correct device and float32 for preprocessing
-        img_batch_gpu = intermediate_image.to(device, dtype=torch.float32) 
+        # Ensure input is on the correct device
+        img_batch_gpu = intermediate_image.to(device) 
         
         # Remove the extra inner dimension -> Shape [B, C, H, W]
         if img_batch_gpu.dim() == 5 and img_batch_gpu.shape[1] == 1:
@@ -134,15 +134,32 @@ class PEFTImageReward(nn.Module):
         elif img_batch_gpu.dim() != 4:
              raise ValueError(f"Unexpected image tensor dimensions: {img_batch_gpu.shape}. Expected 4 (B, C, H, W) or 5 (B, 1, C, H, W).")
 
-        # Apply preprocessing (should handle batches [B, C, H, W])
-        try:
-             processed_intermediate_image = self.preprocess_image(img_batch_gpu) # Output: [B, 3, 224, 224]
-             # print(f"Preprocessed intermediate image shape: {processed_intermediate_image.shape}")
-        except Exception as e:
-             print(f"Error during image preprocessing: {e}")
-             print(f"Image batch shape: {img_batch_gpu.shape}, dtype: {img_batch_gpu.dtype}")
-             print(f"Type of self.preprocess_image: {type(self.preprocess_image)}")
-             raise # Re-raise the exception after printing info
+        # Preprocess images individually as preprocess expects PIL
+        processed_images_list = []
+        for i in range(batch_size):
+            single_img_tensor = img_batch_gpu[i].to(dtype=torch.float32) # Ensure float32 for PIL conversion
+            try:
+                 # Convert tensor [C, H, W] to PIL Image
+                 single_img_pil = to_pil_image(single_img_tensor.cpu()) 
+
+                 # Apply the original model's preprocess method (expects PIL)
+                 processed_single_tensor = self.preprocess_image(single_img_pil) # Output: [3, 224, 224] tensor
+
+                 # Append the processed tensor (move back to device)
+                 processed_images_list.append(processed_single_tensor.to(device))
+                 
+            except Exception as e:
+                 print(f"Error during individual image preprocessing (index {i}): {e}")
+                 print(f"Single image tensor shape: {single_img_tensor.shape}, dtype: {single_img_tensor.dtype}")
+                 # Handle error: skip this image, use a placeholder, or raise
+                 # For now, let's raise to stop execution
+                 raise 
+
+        if not processed_images_list:
+             raise RuntimeError("Preprocessing failed for all images in the batch.")
+
+        # Stack the processed tensors back into a batch -> [B, 3, 224, 224]
+        processed_intermediate_image = torch.stack(processed_images_list, dim=0)
 
         # 2. Get Image Features from PEFT-adapted Vision Encoder
         # Vision encoder expects batch input [B, 3, 224, 224]
