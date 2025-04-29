@@ -125,12 +125,14 @@ class PEFTImageReward(nn.Module):
         # --- End Debug --- 
         
         # 1. Process Image Batch
-        # Remove the explicit batch_size=1 check
-        # if intermediate_image.shape[0] != 1:
-        #     raise ValueError(f"This forward pass currently assumes batch_size=1, but got batch size {intermediate_image.shape[0]}")
-
         # Ensure input is on the correct device and float32 for preprocessing
         img_batch_gpu = intermediate_image.to(device, dtype=torch.float32) 
+        
+        # Remove the extra inner dimension -> Shape [B, C, H, W]
+        if img_batch_gpu.dim() == 5 and img_batch_gpu.shape[1] == 1:
+            img_batch_gpu = img_batch_gpu.squeeze(1)
+        elif img_batch_gpu.dim() != 4:
+             raise ValueError(f"Unexpected image tensor dimensions: {img_batch_gpu.shape}. Expected 4 (B, C, H, W) or 5 (B, 1, C, H, W).")
 
         # Apply preprocessing (should handle batches [B, C, H, W])
         try:
