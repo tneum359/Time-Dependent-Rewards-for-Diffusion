@@ -118,82 +118,75 @@ class PEFTImageReward(nn.Module):
     def forward(self, intermediate_image, timestep, input_ids, attention_mask):
         """ Forward pass using preprocessed intermediate image, timestep, and text. Adapts Vision Encoder. """
         device = next(self.parameters()).device 
-        
+        batch_size = intermediate_image.shape[0]
+
         # --- Debug --- 
-        print(f"[DEBUG] Intermediate image input shape: {intermediate_image.shape}")
+        # print(f"[DEBUG] Intermediate image input shape: {intermediate_image.shape}") # Input shape is [B, C, H, W]
         # --- End Debug --- 
         
-        # Ensure intermediate_image is a single image tensor [C, H, W] (assuming batch_size=1)
-        if intermediate_image.shape[0] != 1:
-            raise ValueError(f"This forward pass currently assumes batch_size=1, but got batch size {intermediate_image.shape[0]}")
-        
-        img_tensor_cpu = intermediate_image.squeeze(0).cpu().to(torch.float32) # Remove batch dim, move to CPU, ensure float32
-            
+        # 1. Process Image Batch
+        # Remove the explicit batch_size=1 check
+        # if intermediate_image.shape[0] != 1:
+        #     raise ValueError(f"This forward pass currently assumes batch_size=1, but got batch size {intermediate_image.shape[0]}")
+
+        # Ensure input is on the correct device and float32 for preprocessing
+        img_batch_gpu = intermediate_image.to(device, dtype=torch.float32) 
+
+        # Apply preprocessing (should handle batches [B, C, H, W])
         try:
-             # 1. Convert SINGLE tensor to PIL
-             img_pil = to_pil_image(img_tensor_cpu)
-             # --- Debug --- 
-             print(f"[DEBUG] Type of img_pil: {type(img_pil)}")
-             print(f"[DEBUG] Type of self.preprocess_image: {type(self.preprocess_image)}")
-             # --- End Debug --- 
-
-             # 2. Preprocess SINGLE PIL image using the model's method
-             processed_intermediate_image = self.base_reward_model.preprocess(img_pil) # Try calling directly
-
-             # 3. Ensure processed tensor is on the correct device and add batch dim back
-             # Assuming preprocess returns [C, 224, 224]
-             processed_intermediate_image = processed_intermediate_image.unsqueeze(0).to(device)
-             print(f"Preprocessed intermediate image shape: {processed_intermediate_image.shape}") # Debug
-
+             processed_intermediate_image = self.preprocess_image(img_batch_gpu) # Output: [B, 3, 224, 224]
+             # print(f"Preprocessed intermediate image shape: {processed_intermediate_image.shape}")
         except Exception as e:
-             print(f"ERROR during preprocessing: {e}")
-             print("Check input/output of self.preprocess_image on single PIL.")
-             raise
+             print(f"Error during image preprocessing: {e}")
+             print(f"Image batch shape: {img_batch_gpu.shape}, dtype: {img_batch_gpu.dtype}")
+             print(f"Type of self.preprocess_image: {type(self.preprocess_image)}")
+             raise # Re-raise the exception after printing info
 
         # 2. Get Image Features from PEFT-adapted Vision Encoder
-        vision_outputs = self.vision_encoder(processed_intermediate_image) # Input should be [1, C, 224, 224]
-        image_features = vision_outputs[:, 0] # Use CLS token output [1, D_vis]
-        print(f"[DEBUG FORWARD] image_features.requires_grad: {image_features.requires_grad}") # <-- DEBUG GRAD
+        # Vision encoder expects batch input [B, 3, 224, 224]
+        vision_outputs = self.vision_encoder(processed_intermediate_image) 
+        image_features = vision_outputs[:, 0] # Use CLS token output -> [B, D_vis]
+        # print(f"[DEBUG FORWARD] image_features.requires_grad: {image_features.requires_grad}") 
 
-        # --- EDIT: Use Standalone Text Encoder --- 
-        # 3. Process Text (using standalone frozen encoder and original projection)
+        # --- Use Standalone Text Encoder --- 
+        # 3. Process Text Batch (using standalone frozen encoder and original projection)
         with torch.no_grad():
-             # Assuming input_ids/attention_mask are already [1, SeqLen]
+             # input_ids/attention_mask should already be [B, SeqLen]
              standalone_text_output = self.standalone_text_encoder.to(device)(
                  input_ids=input_ids.to(device),
                  attention_mask=attention_mask.to(device),
                  return_dict=True
              )
-             # Use CLS token from the standalone encoder output
+             # Use CLS token from the standalone encoder output -> [B, D_text_raw]
              text_features = standalone_text_output.last_hidden_state[:, 0, :] 
-             # Pass through the original model's frozen projection layer
+             # Pass through the original model's frozen projection layer -> [B, D_text_proj]
              projected_text_features = self.text_proj.to(device)(text_features)
-        # --- End EDIT --- 
+        # --- End Standalone Text Encoder --- 
 
         # 4. Get Timestep Embedding (trainable)
-        timestep_emb = self.timestep_embedding(timestep.to(device)) # [1, D_ts]
-        print(f"[DEBUG FORWARD] timestep_emb.requires_grad: {timestep_emb.requires_grad}") # <-- DEBUG GRAD
+        # timestep should be [B]
+        timestep_emb = self.timestep_embedding(timestep.to(device)) # -> [B, D_ts]
+        # print(f"[DEBUG FORWARD] timestep_emb.requires_grad: {timestep_emb.requires_grad}") 
 
         # 5. Fuse Features (trainable layers)
         # Concatenate along the feature dimension (dim=1)
-        # Ensure projected_text_features is expanded if needed (though it should be [1, D_text_proj])
         combined_features = torch.cat([
-            image_features,                 # [1, D_vis]
-            projected_text_features,        # [1, D_text_proj]
-            timestep_emb                    # [1, D_ts]
-        ], dim=1) # Result shape [1, D_vis + D_text_proj + D_ts]
-        fused_features = self.fusion_layer(combined_features) # [1, D_fusion_out]
-        print(f"[DEBUG FORWARD] fused_features.requires_grad: {fused_features.requires_grad}") # <-- DEBUG GRAD
+            image_features,                 # [B, D_vis]
+            projected_text_features,        # [B, D_text_proj]
+            timestep_emb                    # [B, D_ts]
+        ], dim=1) # Result shape [B, D_vis + D_text_proj + D_ts]
+        fused_features = self.fusion_layer(combined_features) # -> [B, D_fusion_out]
+        # print(f"[DEBUG FORWARD] fused_features.requires_grad: {fused_features.requires_grad}") 
 
         # 6. Project to Reward Head Input Dimension (trainable layer)
-        fused_features_projected = self.fusion_to_reward_proj(fused_features) # [1, D_mlp_in]
-        print(f"[DEBUG FORWARD] fused_features_projected.requires_grad: {fused_features_projected.requires_grad}") # <-- DEBUG GRAD
+        fused_features_projected = self.fusion_to_reward_proj(fused_features) # -> [B, D_mlp_in]
+        # print(f"[DEBUG FORWARD] fused_features_projected.requires_grad: {fused_features_projected.requires_grad}") 
 
-        # 7. Pass through ORIGINAL Reward Head MLP (frozen)
-        reward_score = self.reward_head(fused_features_projected) # [1, 1]
-        print(f"[DEBUG FORWARD] reward_score.requires_grad: {reward_score.requires_grad}") # <-- DEBUG GRAD
+        # 7. Pass through Reward Head MLP (now trainable)
+        reward_score = self.reward_head(fused_features_projected) # -> [B, 1]
+        # print(f"[DEBUG FORWARD] reward_score.requires_grad: {reward_score.requires_grad}") 
 
-        return reward_score
+        return reward_score # Shape [B, 1]
 
 class TimestepEmbedding(nn.Module):
     def __init__(self, dim):
