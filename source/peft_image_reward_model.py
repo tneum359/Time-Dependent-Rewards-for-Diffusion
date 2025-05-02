@@ -188,20 +188,35 @@ class PEFTImageReward(nn.Module):
         image_features = vision_outputs[:, 0] # Use CLS token output -> [B, D_vis]
         # print(f"[DEBUG FORWARD] image_features.requires_grad: {image_features.requires_grad}") 
 
-        # --- Use Standalone Text Encoder --- 
+        # --- Use Standalone Text Encoder ---
         # 3. Process Text Batch (using standalone frozen encoder and original projection)
         with torch.no_grad():
-             # input_ids/attention_mask should already be [B, SeqLen]
-             standalone_text_output = self.standalone_text_encoder.to(device)(
-                 input_ids=input_ids.to(device),
-                 attention_mask=attention_mask.to(device),
-                 return_dict=True
-             )
+             # input_ids/attention_mask arrive as [B, 1, SeqLen] from dataloader/saving,
+             # but text encoder expects [B, SeqLen]. Squeeze the middle dimension.
+             if input_ids.ndim == 3 and input_ids.shape[1] == 1:
+                 input_ids_squeezed = input_ids.squeeze(1)
+                 # print(f"Squeezed input_ids shape: {input_ids_squeezed.shape}")
+             else:
+                  input_ids_squeezed = input_ids # Assume correct shape if not [B, 1, SeqLen]
+
+             if attention_mask.ndim == 3 and attention_mask.shape[1] == 1:
+                  attention_mask_squeezed = attention_mask.squeeze(1)
+                  # print(f"Squeezed attention_mask shape: {attention_mask_squeezed.shape}")
+             else:
+                   attention_mask_squeezed = attention_mask # Assume correct shape
+
+             standalone_text_output = self.standalone_text_encoder.to(device)(\
+                 input_ids=input_ids_squeezed.to(device),\
+                 attention_mask=attention_mask_squeezed.to(device),\
+                 return_dict=True\
+             )\
              # Use CLS token from the standalone encoder output -> [B, D_text_raw]
-             text_features = standalone_text_output.last_hidden_state[:, 0, :] 
+             # Use pooler_output for RoBERTa-style models
+             text_features = standalone_text_output.pooler_output
+
              # Pass through the original model's frozen projection layer -> [B, D_text_proj]
              projected_text_features = self.text_proj.to(device)(text_features)
-        # --- End Standalone Text Encoder --- 
+        # --- End Standalone Text Encoder ---
 
         # 4. Get Timestep Embedding (trainable)
         # timestep should be [B]
