@@ -203,8 +203,13 @@ class Node:
         self.total_value: float = 0.0 # Q (sum of rewards from evaluations)
 
         # Actions to explore from this node
+        print(f"Creating node at t_index={t_index} with {len(available_actions) if available_actions is not None else 0} available actions")
+        if available_actions is None:
+            print("WARNING: available_actions is None, using empty list")
+            available_actions = []
         self.untried_actions = available_actions[:] # Make a copy
         random.shuffle(self.untried_actions) # Shuffle for random exploration order
+        print(f"Node created with {len(self.untried_actions)} untried actions")
 
     @property
     def value_estimate(self) -> float:
@@ -241,11 +246,11 @@ class Node:
                 best_child = child
 
         if best_child is None:
-             # Fallback needed if selection fails (e.g., only child has 0 visits but log_parent is 0)
-             if self.children:
-                 print(f"Warning: select_child found no best child for Node(t={self.t_index}, N={self.visit_count}). Returning first child.")
+            # Fallback needed if selection fails (e.g., only child has 0 visits but log_parent is 0)
+            if self.children:
+                print(f"Warning: select_child found no best child for Node(t={self.t_index}, N={self.visit_count}). Returning first child.")
                 return next(iter(self.children.values()))
-             else:
+            else:
                 raise RuntimeError(f"select_child called on node {self.t_index} with no children")
 
         return best_child
@@ -255,12 +260,6 @@ class Node:
         if action in self.children:
             # This might happen if hash collision occurs or logic error
             print(f"Warning: Action {action} already expanded for node at t_index={self.t_index}. Overwriting.")
-            # raise ValueError(f"Action {action} already expanded for node at t={self.t_index}")
-        # Action should have been popped from untried_actions before calling expand
-        # if action in self.untried_actions:
-        #      print(f"Warning: Action {action} was still in untried_actions during expand call.")
-        #      self.untried_actions.remove(action)
-
         self.children[action] = child_node
 
     def update(self, reward: float) -> None:
@@ -269,9 +268,7 @@ class Node:
         self.total_value += reward
         
     def __repr__(self):
-        # Use requires_grad check to avoid tensor data printing if not needed
-        # latent_info = f"z_t shape={self.z_t.shape}, grad={self.z_t.requires_grad}"
-        latent_info = f"z_t shape={self.z_t.shape}" # Keep it concise
+        latent_info = f"z_t shape={self.z_t.shape}"
         return (f"Node(t_idx={self.t_index}, N={self.visit_count}, Q={self.total_value:.3f}, "
                 f"Value={self.value_estimate:.3f}, Children={len(self.children)}, "
                 f"Untried={len(self.untried_actions)}, {latent_info})")
@@ -387,58 +384,54 @@ class MCTS:
         Returns:
              The newly created child node and its immediate reward.
         """
-        if node.is_terminal(): raise ValueError("Cannot expand a terminal node.")
-        if node.is_fully_expanded(): raise ValueError("Node is already fully expanded.")
+        if node.is_terminal():
+            raise ValueError("Cannot expand a terminal node.")
+        if node.is_fully_expanded():
+            raise ValueError("Node is already fully expanded.")
+
+        print(f"Expanding node at t_index={node.t_index} with {len(node.untried_actions)} untried actions")
+        if not node.untried_actions:
+            print("ERROR: No untried actions available for expansion")
+            raise ValueError("No untried actions available for expansion")
 
         action = node.untried_actions.pop()
+        print(f"Selected action for expansion: {action}")
 
         # --- Simulate the action ---
         z_t_current = node.z_t.clone().to(self.device) # Ensure it's on device
         child_noise_seed = None
         if action.noise_sigma > 0:
             if node.noise_seed is not None:
-                 child_noise_seed = hash((node.noise_seed, action)) & ((1 << 32) -1)
+                child_noise_seed = hash((node.noise_seed, action)) & ((1 << 32) -1)
             
-            # print(f"Applying noise sigma={action.noise_sigma} with seed={child_noise_seed} at t_idx={node.t_index}")
             z_t_current = self.flow_integrator.apply_noise(
                 z_t_current, action.noise_sigma, rng_seed=child_noise_seed
             )
 
         # Perform the diffusion flow step (implicitly steps back by 1)
-        t_prev_index = node.t_index - 1 # Simple step back by 1 index
-        # print(f"Stepping from t_idx={node.t_index} to t_prev_idx={t_prev_index} with action {action}")
+        t_prev_index = node.t_index - 1
         try:
-             # Ensure z_t_current is correct dtype before passing to step
-             z_t_prev = self.flow_integrator.step(z_t_current.to(self.pipeline.dtype), node.t_index, action)
-             
-             # --- NFE Tracking ---
-             self.nfe_count += 1 # Increment AFTER successful step
-             # --- End NFE Tracking ---
-             
+            # Ensure z_t_current is correct dtype before passing to step
+            z_t_prev = self.flow_integrator.step(z_t_current.to(self.pipeline.dtype), node.t_index, action)
+            
+            # --- NFE Tracking ---
+            self.nfe_count += 1 # Increment AFTER successful step
+            # --- End NFE Tracking ---
+            
         except Exception as e:
-             print(f"ERROR during flow integrator step from {node.t_index} to {t_prev_index}: {e}")
-             # Create a dummy node to mark this path as failed
-             dummy_node = Node(t_index=t_prev_index, z_t=torch.zeros_like(node.z_t), parent=node, action_taken=action, available_actions=self.action_space)
-             node.expand(action, dummy_node)
-             return dummy_node, -float('inf') # Signal failure
+            print(f"ERROR during flow integrator step from {node.t_index} to {t_prev_index}: {e}")
+            # Create a dummy node to mark this path as failed
+            dummy_node = Node(t_index=t_prev_index, z_t=torch.zeros_like(node.z_t), parent=node, action_taken=action, available_actions=self.action_space)
+            node.expand(action, dummy_node)
+            return dummy_node, -float('inf') # Signal failure
 
         # --- Decode and Evaluate ---
         reward = -float('inf') # Default to worst reward
         try:
-            # print(f"Decoding z at t_prev_idx={t_prev_index}")
-            # Pass the latent *before* the step (z_t_prev) to be decoded
-            # But the reward function might want the score of the *resulting* state (at t_prev_index)
-            # Let's decode z_t_prev.
             decoded_image = self.decoder.decode(z_t_prev)
-
-            # print(f"Scoring decoded image at t_prev_idx={t_prev_index}")
-            # Pass the image, prompt, and the *resulting* timestep index
             reward = self.reward_model.score(decoded_image, self.prompt, t_prev_index)
-            # print(f"Reward received: {reward:.4f}")
-
         except Exception as e:
             print(f"ERROR during decode/reward scoring at t_prev_idx={t_prev_index}: {e}")
-            # Reward remains -inf
 
         # --- Create new child node ---
         child_node = Node(
@@ -492,7 +485,6 @@ class MCTS:
             if selected_node.is_terminal():
                  # Selected a terminal node. Backpropagate its stored value estimate.
                  reward = selected_node.value_estimate
-                 # print(f"Selected terminal node {selected_node.t_index}, using value {reward:.3f}")
             elif selected_node.is_fully_expanded() and not selected_node.children:
                  # Selected a non-terminal node that's fully expanded but has no children
                  # This implies previous expansions failed or it's a dead end.
@@ -552,8 +544,8 @@ class MCTS:
                 if visited_children:
                     for action, child in visited_children.items():
                         if child.value_estimate > max_value:
-                        max_value = child.value_estimate
-                        best_child = child
+                            max_value = child.value_estimate
+                            best_child = child
                             best_action = action # Store action
                 else:
                     # If no children visited, maybe pick the first one? Or based on initial reward?
@@ -569,10 +561,10 @@ class MCTS:
 
             trajectory_nodes.append(best_child)
             if best_action is not None: # Ensure action was found
-            trajectory_actions.append(best_action)
+                trajectory_actions.append(best_action)
             else: # Should not happen if best_child was found
-                 print(f"Error: Best child found but corresponding action missing at node {current_node.t_index}")
-                 break
+                print(f"Error: Best child found but corresponding action missing at node {current_node.t_index}")
+                break
             current_node = best_child
 
         return trajectory_nodes, trajectory_actions
@@ -667,22 +659,22 @@ if __name__ == "__main__":
     # --- Run MCTS ---
     print("\nInstantiating MCTS...")
     try:
-    mcts_instance = MCTS(
+        mcts_instance = MCTS(
             initial_t_index=initial_t_index,
-        initial_z_t=initial_z,
+            initial_z_t=initial_z,
             pipeline=pipe,
             reward_model=reward_model,
-        action_space=action_space,
+            action_space=action_space,
             prompt=prompt,
             negative_prompt=negative_prompt,
             exploration_constant=1.0, # Lower exploration for demo
             device=device
         )
     except Exception as e:
-         print(f"ERROR during MCTS instantiation: {e}")
-         import traceback
-         traceback.print_exc()
-         exit()
+        print(f"ERROR during MCTS instantiation: {e}")
+        import traceback
+        traceback.print_exc()
+        exit()
 
 
     print("\nStarting MCTS Search...")
@@ -699,41 +691,41 @@ if __name__ == "__main__":
 
     # Get best path based on visits
     try:
-    best_nodes_visits, best_actions_visits = mcts_instance.get_best_trajectory(criteria='visits')
-    print("\nBest Trajectory (Most Visits):")
-    for i, node in enumerate(best_nodes_visits):
+        best_nodes_visits, best_actions_visits = mcts_instance.get_best_trajectory(criteria='visits')
+        print("\nBest Trajectory (Most Visits):")
+        for i, node in enumerate(best_nodes_visits):
             print(f"  Step {i}: Node(t_idx={node.t_index}, V={node.value_estimate:.3f}, N={node.visit_count})")
         if i < len(best_actions_visits):
             print(f"    Action Taken: {best_actions_visits[i]}")
         
         # Optionally decode the final image from the best trajectory
         if best_nodes_visits:
-             final_node = best_nodes_visits[-1]
-             if final_node.t_index <= MIN_TIMESTEP_INDEX :
-                 print("\nDecoding final image from best trajectory (visits)...")
-                 final_image = mcts_instance.decoder.decode(final_node.z_t)
-                 final_image.save("mcts_best_visits_final.png")
-                 print("Saved final image as mcts_best_visits_final.png")
+            final_node = best_nodes_visits[-1]
+            if final_node.t_index <= MIN_TIMESTEP_INDEX :
+                print("\nDecoding final image from best trajectory (visits)...")
+                final_image = mcts_instance.decoder.decode(final_node.z_t)
+                final_image.save("mcts_best_visits_final.png")
+                print("Saved final image as mcts_best_visits_final.png")
 
     except Exception as e:
-         print(f"Error getting/decoding best trajectory (visits): {e}")
+        print(f"Error getting/decoding best trajectory (visits): {e}")
 
     # Get best path based on value
     try:
-    best_nodes_value, best_actions_value = mcts_instance.get_best_trajectory(criteria='value')
-    print("\nBest Trajectory (Highest Value):")
-    for i, node in enumerate(best_nodes_value):
+        best_nodes_value, best_actions_value = mcts_instance.get_best_trajectory(criteria='value')
+        print("\nBest Trajectory (Highest Value):")
+        for i, node in enumerate(best_nodes_value):
             print(f"  Step {i}: Node(t_idx={node.t_index}, V={node.value_estimate:.3f}, N={node.visit_count})")
         if i < len(best_actions_value):
             print(f"    Action Taken: {best_actions_value[i]}")
 
         if best_nodes_value:
-             final_node_val = best_nodes_value[-1]
-             if final_node_val.t_index <= MIN_TIMESTEP_INDEX:
-                  print("\nDecoding final image from best trajectory (value)...")
-                  final_image_val = mcts_instance.decoder.decode(final_node_val.z_t)
-                  final_image_val.save("mcts_best_value_final.png")
-                  print("Saved final image as mcts_best_value_final.png")
+            final_node_val = best_nodes_value[-1]
+            if final_node_val.t_index <= MIN_TIMESTEP_INDEX:
+                print("\nDecoding final image from best trajectory (value)...")
+                final_image_val = mcts_instance.decoder.decode(final_node_val.z_t)
+                final_image_val.save("mcts_best_value_final.png")
+                print("Saved final image as mcts_best_value_final.png")
                   
     except Exception as e:
-         print(f"Error getting/decoding best trajectory (value): {e}")
+        print(f"Error getting/decoding best trajectory (value): {e}")
