@@ -86,43 +86,72 @@ def generate_and_decode_latent(hf_token=None, image_size=512, num_inference_step
     capture_step = random.randint(1, num_inference_steps - 1) 
     print(f"Will attempt to capture latent at inference step: {capture_step}")
 
+    # image_size is accessible here due to closure
     def callback_fn(pipe, step, timestep, callback_kwargs):
         nonlocal intermediate_latent_image, captured_timestep_value
-        latents = callback_kwargs["latents"]
+        # latents are from callback_kwargs, make sure they are on the correct device for unpacking
+        current_latents_from_callback = callback_kwargs["latents"].to(pipe.device)
+
 
         if step == capture_step:
             print(f"Callback triggered at step {step}, timestep {timestep}")
-            # Decode the latents from this step
             with torch.no_grad():
-                # Ensure latents are on the correct device and dtype for VAE
-                latents_for_decode = latents.to(pipe.vae.device, dtype=pipe.vae.dtype)
-                
-                # Scale latents before decoding (common practice for VAEs)
-                # The scaling factor might vary or be handled differently in FLUX, consult docs if issues arise.
-                # Defaulting to a common scaling approach for now.
-                if hasattr(pipe.vae.config, 'scaling_factor'):
-                    latents_for_decode = latents_for_decode / pipe.vae.config.scaling_factor
+                latents_to_process_for_vae = None
+
+                # --- Unpack latents (FLUX specific) ---
+                if hasattr(pipe, '_unpack_latents'):
+                    try:
+                        # vae_scale_factor is often related to the VAE's downsampling.
+                        # FluxPipeline has vae_scale_factor attribute
+                        vae_scale_factor = pipe.vae_scale_factor 
+                        print(f"Attempting to unpack latents with shape: {current_latents_from_callback.shape} using image_size: {image_size} and vae_scale_factor: {vae_scale_factor}")
+                        # _unpack_latents might expect latents on CPU or a specific device/dtype.
+                        # The example uses latents directly.
+                        unpacked_latents = pipe._unpack_latents(current_latents_from_callback, image_size, image_size, vae_scale_factor)
+                        print(f"Unpacked latents shape: {unpacked_latents.shape}")
+                        latents_to_process_for_vae = unpacked_latents
+                    except Exception as unpack_e:
+                        print(f"Warning: Failed to unpack latents using pipe._unpack_latents: {unpack_e}")
+                        traceback.print_exc()
+                        print("Proceeding with original latents for VAE decode, channel mismatch might occur.")
+                        latents_to_process_for_vae = current_latents_from_callback
                 else:
-                    # FLUX VAE might not use/expose scaling_factor in the same way. 
-                    # If this path is taken and decoding is poor, this might be the reason.
-                    print("Warning: VAE scaling_factor not found in config. Proceeding without scaling.")
+                    print("Warning: pipe._unpack_latents method not found. Proceeding with original latents.")
+                    latents_to_process_for_vae = current_latents_from_callback
+
+                # Ensure latents for VAE are on VAE's device and dtype
+                latents_for_vae_decode = latents_to_process_for_vae.to(pipe.vae.device, dtype=pipe.vae.dtype)
+
+                # --- Scale and shift latents before VAE decoding ---
+                # This scaling is specific to AutoencoderKL type VAEs.
+                # Flux's VAE might handle this differently or it might be done post-unpacking.
+                scaling_factor = getattr(pipe.vae.config, 'scaling_factor', None)
+                shift_factor = getattr(pipe.vae.config, 'shift_factor', 0.0) 
+
+                if scaling_factor is not None:
+                    print(f"Applying VAE scaling_factor: {scaling_factor} and shift_factor: {shift_factor}")
+                    latents_for_vae_decode = (latents_for_vae_decode / scaling_factor) + shift_factor
+                else:
+                    # This was hit before, indicating Flux VAE might not use this scaling_factor.
+                    # The example from GitHub discussion applies this *after* _unpack_latents.
+                    print("Warning: VAE config.scaling_factor not found. Scaling might be part of _unpack_latents or handled differently by Flux VAE.")
+
 
                 # Decode using the VAE
-                # vae.decode returns a_dict with a 'sample' key, or just the sample directly
-                decoded_output = pipe.vae.decode(latents_for_decode)
-                # The actual image tensor is usually in decoded_output.sample if it's a VAEOutput object
-                image_tensor = decoded_output.sample if hasattr(decoded_output, 'sample') else decoded_output[0]
+                print(f"Decoding latents with shape: {latents_for_vae_decode.shape}, device: {latents_for_vae_decode.device}, dtype: {latents_for_vae_decode.dtype}")
+                decoded_output = pipe.vae.decode(latents_for_vae_decode, return_dict=False)
+                image_tensor = decoded_output[0]
+                print(f"Decoded image tensor shape: {image_tensor.shape}")
 
                 # Postprocess to PIL Image
-                # The image_processor expects a batch, ensure image_tensor has a batch dim if needed
-                # For a single latent, image_tensor is likely [C, H, W], add batch dim -> [1, C, H, W]
-                if image_tensor.ndim == 3:
-                    image_tensor = image_tensor.unsqueeze(0)
+                # image_processor.postprocess expects batch dimension
+                if image_tensor.ndim == 3: # [C, H, W]
+                    image_tensor = image_tensor.unsqueeze(0) # [1, C, H, W]
                 
                 pil_images = pipe.image_processor.postprocess(image_tensor, output_type="pil")
 
                 if pil_images and len(pil_images) > 0:
-                    intermediate_latent_image = pil_images[0] # Take the first image
+                    intermediate_latent_image = pil_images[0]
                     captured_timestep_value = timestep.item() if torch.is_tensor(timestep) else timestep
                     print(f"Captured and decoded intermediate latent image at step {step}.")
                 else:
