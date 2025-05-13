@@ -7,6 +7,7 @@ import argparse
 from huggingface_hub import login
 from PIL import Image
 import numpy as np
+import traceback
 
 def plot_images_side_by_side(image1, title1, image2, title2):
     """Plots two images side by side."""
@@ -63,9 +64,11 @@ def generate_and_decode_latent(hf_token=None, image_size=512, num_inference_step
             # token=hf_token # from_pretrained uses the global login
         )
         if device == "cuda":
-             pipeline.to(device)
+            print("CUDA device detected. Enabling model CPU offload to potentially save memory.")
+            pipeline.enable_model_cpu_offload() # Enable offload first
+            pipeline.to(device) # Then move to device
         else: # If on CPU, or if CUDA is available but model is too large for VRAM
-            print("Enabling model CPU offload for the pipeline.")
+            print("CUDA not available or not primary. Enabling model CPU offload for the pipeline.")
             pipeline.enable_model_cpu_offload()
 
     except Exception as e:
@@ -119,6 +122,7 @@ def generate_and_decode_latent(hf_token=None, image_size=512, num_inference_step
         print("Image generation complete.")
     except Exception as e:
         print(f"Error during image generation: {e}")
+        traceback.print_exc()
         return
 
     # --- Plot Results ---
