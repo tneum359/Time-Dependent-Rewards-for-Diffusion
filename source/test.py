@@ -93,18 +93,40 @@ def generate_and_decode_latent(hf_token=None, image_size=512, num_inference_step
         if step == capture_step:
             print(f"Callback triggered at step {step}, timestep {timestep}")
             # Decode the latents from this step
-            # The latents need to be scaled before decoding if using VAE from pipeline
-            # For Flux, pipeline.decode_latents should handle this.
             with torch.no_grad():
-                # Ensure latents are on the correct device for decoding
-                decoded_latents = pipeline.decode_latents(latents.to(pipeline.device, dtype=pipeline.text_encoder.dtype if hasattr(pipeline, 'text_encoder') else torch.float32)) # Use appropriate dtype
-                # pipeline.decode_latents returns a list of PIL images
-                if decoded_latents and len(decoded_latents) > 0:
-                    intermediate_latent_image = decoded_latents[0] # Take the first image if batch > 1
+                # Ensure latents are on the correct device and dtype for VAE
+                latents_for_decode = latents.to(pipe.vae.device, dtype=pipe.vae.dtype)
+                
+                # Scale latents before decoding (common practice for VAEs)
+                # The scaling factor might vary or be handled differently in FLUX, consult docs if issues arise.
+                # Defaulting to a common scaling approach for now.
+                if hasattr(pipe.vae.config, 'scaling_factor'):
+                    latents_for_decode = latents_for_decode / pipe.vae.config.scaling_factor
+                else:
+                    # FLUX VAE might not use/expose scaling_factor in the same way. 
+                    # If this path is taken and decoding is poor, this might be the reason.
+                    print("Warning: VAE scaling_factor not found in config. Proceeding without scaling.")
+
+                # Decode using the VAE
+                # vae.decode returns a_dict with a 'sample' key, or just the sample directly
+                decoded_output = pipe.vae.decode(latents_for_decode)
+                # The actual image tensor is usually in decoded_output.sample if it's a VAEOutput object
+                image_tensor = decoded_output.sample if hasattr(decoded_output, 'sample') else decoded_output[0]
+
+                # Postprocess to PIL Image
+                # The image_processor expects a batch, ensure image_tensor has a batch dim if needed
+                # For a single latent, image_tensor is likely [C, H, W], add batch dim -> [1, C, H, W]
+                if image_tensor.ndim == 3:
+                    image_tensor = image_tensor.unsqueeze(0)
+                
+                pil_images = pipe.image_processor.postprocess(image_tensor, output_type="pil")
+
+                if pil_images and len(pil_images) > 0:
+                    intermediate_latent_image = pil_images[0] # Take the first image
                     captured_timestep_value = timestep.item() if torch.is_tensor(timestep) else timestep
                     print(f"Captured and decoded intermediate latent image at step {step}.")
                 else:
-                    print(f"Warning: pipeline.decode_latents did not return an image at step {step}.")
+                    print(f"Warning: VAE decoding or postprocessing did not return an image at step {step}.")
         
         return callback_kwargs
 
