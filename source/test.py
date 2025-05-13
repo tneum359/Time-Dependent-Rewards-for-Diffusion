@@ -33,6 +33,8 @@ def plot_images_side_by_side(image1, title1, image2, title2):
     axes[1].axis('off')
     
     plt.tight_layout()
+    plt.savefig("generated_plot.png") # Save the figure
+    print("Plot saved to generated_plot.png")
     plt.show()
 
 def generate_and_decode_latent(hf_token=None, image_size=512, num_inference_steps=50, prompt=""):
