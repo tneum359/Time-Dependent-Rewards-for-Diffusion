@@ -86,8 +86,10 @@ def generate_and_decode_latent(hf_token=None, image_size=512, num_inference_step
     capture_step = random.randint(1, num_inference_steps - 1) 
     print(f"Will attempt to capture latent at inference step: {capture_step}")
 
-    def callback_fn(pipe, step, timestep, latents):
+    def callback_fn(pipe, step, timestep, callback_kwargs):
         nonlocal intermediate_latent_image, captured_timestep_value
+        latents = callback_kwargs["latents"]
+
         if step == capture_step:
             print(f"Callback triggered at step {step}, timestep {timestep}")
             # Decode the latents from this step
@@ -103,6 +105,8 @@ def generate_and_decode_latent(hf_token=None, image_size=512, num_inference_step
                     print(f"Captured and decoded intermediate latent image at step {step}.")
                 else:
                     print(f"Warning: pipeline.decode_latents did not return an image at step {step}.")
+        
+        return callback_kwargs
 
 
     # --- Generate Image ---
